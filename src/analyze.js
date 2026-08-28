@@ -18,6 +18,7 @@ import {
 } from "node:fs";
 import { join, relative, sep, resolve } from "node:path";
 import { analyzeSource, analyzeManifest } from "./rules.js";
+import { loadConfig, CONFIG_NAME } from "./config.js";
 
 const SOURCE_EXT = new Set([".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".mts", ".cts"]);
 const SKIP_DIRS = new Set([
@@ -215,6 +216,9 @@ export function analyzeProject(rootDir, opts = {}) {
     };
   }
 
+  const cfg = loadConfig(rootDir, errors);
+  const stats = { suppressedByConfig: 0 };
+
   for (const file of walk(rootDir, errors)) {
     const base = file.split(sep).pop();
     const rel = relative(rootDir, file) || base;
@@ -249,7 +253,17 @@ export function analyzeProject(rootDir, opts = {}) {
       continue;
     }
     scannedFiles.push(rel);
-    for (const f of analyzeSource(txt, rel)) findings.push(f);
+    for (const f of analyzeSource(txt, rel, cfg, stats)) findings.push(f);
+  }
+
+  // Config-driven suppression is a human assertion, not an analysis result, so
+  // it is always surfaced. A scanner that silently drops findings because of a
+  // file in the repo it just scanned is worse than one that over-reports.
+  if (stats.suppressedByConfig > 0) {
+    errors.push(
+      `${stats.suppressedByConfig} finding(s) suppressed by ${CONFIG_NAME} ` +
+        `(pathValidators / trustedPathVars). Delete or rename that file to see them.`,
+    );
   }
 
   // A hostile tree could otherwise emit a multi-MB `errors` array; cap it so

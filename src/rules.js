@@ -984,8 +984,17 @@ function pathContainmentRe(orig) {
 const VALIDATOR_CALL_RE =
   /\b(?:await\s+)?(?:[\w$]+\s*\.\s*)?((?:validate|sanitiz|assert|ensure|check|guard|verif|secure|safe)[\w$]*)\s*\(/i;
 
-function rulefsPathTraversal(orig, masked, file, findings) {
+function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
   const { code } = masked;
+  // Project-declared assertions (see src/config.js). These SUPPRESS rather
+  // than downgrade, because a human explicitly took responsibility for them —
+  // but every suppression is counted and reported, so this can never quietly
+  // hide a finding.
+  const declaredValidators = new Set(cfg?.pathValidators ?? []);
+  const trustedVars = new Set(cfg?.trustedPathVars ?? []);
+  const suppress = () => {
+    if (stats) stats.suppressedByConfig = (stats.suppressedByConfig ?? 0) + 1;
+  };
   // require an fs binding so a random `readFile(` helper on another object is
   // not a finding (provenance), mirroring MCP001's discipline.
   const usesFs =
@@ -1014,6 +1023,11 @@ function rulefsPathTraversal(orig, masked, file, findings) {
     const isConcat = /\+/.test(p) || /\$\{/.test(p) || /^`/.test(p);
     const isBareRef = /^[\w$][\w$.[\]'"]*$/.test(p); // userPath, req.body.f
     if (!isConcat && !isBareRef) continue; // e.g. a fn() result — unknown, skip
+    // The project declared this parameter/variable pre-validated.
+    if (trustedVars.size && /^[\w$]+$/.test(p) && trustedVars.has(p)) {
+      suppress();
+      continue;
+    }
     // HOISTED-CONTAINMENT GUARD (the moat): extract-to-named-variable is
     // idiomatic SAFE code, e.g.
     //   const safe = path.resolve(BASE, path.basename(n)); readFileSync(safe)
@@ -1049,6 +1063,16 @@ function rulefsPathTraversal(orig, masked, file, findings) {
       if (lastRhs) {
         const v = VALIDATOR_CALL_RE.exec(lastRhs);
         if (v) viaValidator = v[1];
+        // A validator the project explicitly declared is an assertion by a
+        // human, not a guess from a naming convention: suppress, don't
+        // downgrade. Still counted and reported.
+        if (declaredValidators.size) {
+          const d = /(?:await\s+)?(?:[\w$]+\s*\.\s*)?([\w$]+)\s*\(/.exec(lastRhs);
+          if (d && declaredValidators.has(d[1])) {
+            suppress();
+            continue;
+          }
+        }
       }
     }
     const at = lineColAt(code, m.index);
@@ -1166,7 +1190,7 @@ function splitTopLevel(s) {
  * @param {string} relPath - path label used in findings
  * @returns {Finding[]}
  */
-export function analyzeSource(src, relPath) {
+export function analyzeSource(src, relPath, cfg, stats) {
   const findings = [];
   if (typeof src !== "string" || src === "") return findings;
   const masked = maskNonCode(src);
@@ -1177,7 +1201,7 @@ export function analyzeSource(src, relPath) {
   ruleProtoPollution(src, masked, relPath, findings);
   ruleSsrfFetch(src, masked, relPath, findings);
   ruleHardcodedSecret(src, masked, relPath, findings);
-  rulefsPathTraversal(src, masked, relPath, findings);
+  rulefsPathTraversal(src, masked, relPath, findings, cfg, stats);
   ruleUnsafeDeserialize(src, masked, relPath, findings);
   return findings;
 }

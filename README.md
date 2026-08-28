@@ -123,6 +123,46 @@ findings**; it is part of CI.
 | `--sarif` | SARIF v2.1.0 | upload with `github/codeql-action/upload-sarif@v3` to populate the **Code scanning** tab; each result carries the stable finding id as a `partialFingerprint` so GitHub de-dupes across runs |
 | `--monitor-json` | JSON | (with `--baseline`) the structured monitoring record — the machine contract a hosted tier would consume; this build only prints it locally |
 
+### Project config (`mcpaudit.config.json`) — for what the analyzer can't know
+
+There is exactly one thing a lexical scanner cannot resolve on its own: a path
+that reaches an `fs.*` call as a **function parameter**. There is no assignment
+to look back at, and without taint tracking there is no way to know whether the
+caller validated it. The official MCP `filesystem` server is the canonical
+case — its `lib.ts` exports functions taking a path, and every real caller runs
+`validatePath()` first, but the scanner can only see the callee.
+
+Drop a `mcpaudit.config.json` at the scan root to tell it what you know:
+
+```json
+{
+  "pathValidators":  ["validatePath", "assertInsideRoot"],
+  "trustedPathVars": ["filePath", "tempPath", "currentPath"]
+}
+```
+
+| key | meaning |
+|-----|---------|
+| `pathValidators` | a value assigned from one of these calls is treated as **contained**, instead of merely downgraded to `low` |
+| `trustedPathVars` | variable/parameter names you assert are validated before reaching a filesystem call |
+
+Both are assertions by a human who took responsibility, so they suppress rather
+than downgrade. Unknown keys and non-identifier entries are ignored and
+reported; a malformed file never aborts the scan.
+
+**Suppression is never silent.** Every run prints how many findings the config
+removed, in the human report and in `--json`:
+
+```
+diagnostics (scan was degraded, not aborted):
+  - 13 finding(s) suppressed by mcpaudit.config.json (pathValidators /
+    trustedPathVars). Delete or rename that file to see them.
+```
+
+A scanner that quietly drops findings because of a file in the repo it just
+scanned is worse than one that over-reports. If you inherit a repo with this
+file in it, you can see at a glance that it is there and what it cost you.
+
 ### Continuous monitoring (baseline diff — free, offline, no accounts)
 
 A one-shot scan tells you today's state. A team usually wants *"did anything
