@@ -1164,6 +1164,34 @@ function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
         const g = guardRe.exec(win);
         if (g) viaValidator = g[1];
       }
+      // SAME-FILE PATH HELPER. Naming conventions only get you so far:
+      //     function getTokenFilePath() {
+      //       return path.join(getConfigDir(), 'tokens.json');
+      //     }
+      //     const tokenPath = getTokenFilePath();
+      //     await fs.writeFile(tokenPath, ...);
+      // `getTokenFilePath` matches no validator pattern, but its body is right
+      // there in the same file and visibly contains the containment idiom. That
+      // is stronger evidence than a name, so read it instead of guessing.
+      if (!viaValidator && lastRhs) {
+        const call = /(?:await\s+)?(?:[\w$]+\s*\.\s*)?([\w$]+)\s*\(/.exec(lastRhs);
+        if (call) {
+          const fn = call[1];
+          // Function declaration, assigned arrow/function, or a class method
+          // (`private resolvePath(p: string) { ... }` is just as common as a
+          // free function, and `this.resolvePath(x)` reaches it the same way).
+          const defRe = new RegExp(
+            `function\\s+${fn}\\s*\\(` +
+              `|(?:const|let|var)\\s+${fn}\\s*=` +
+              `|[\\n;{]\\s*(?:(?:private|public|protected|static|async|readonly)\\s+)*${fn}\\s*\\(`,
+          );
+          const d = defRe.exec(orig);
+          // Bounded window approximates the function body without parsing.
+          if (d && containmentRe.test(orig.slice(d.index, d.index + 600))) {
+            viaValidator = fn;
+          }
+        }
+      }
       if (lastRhs) {
         const v = VALIDATOR_CALL_RE.exec(lastRhs);
         if (v) viaValidator = v[1];
