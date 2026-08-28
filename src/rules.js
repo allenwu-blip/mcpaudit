@@ -860,6 +860,18 @@ function ruleSsrfFetch(orig, masked, file, findings) {
     // ORIGINAL source at the same offsets so literal text is visible to
     // classifyUrlExpr (origin-fixed detection needs the literal contents).
     const { end } = scanCallArgs(code, openIdx);
+
+    // NOT A CALL: `async fetch(request) { ... }` is a METHOD DEFINITION. It is
+    // the standard server entry point for Bun, Deno and Cloudflare Workers —
+    //     const server = Bun.serve({ port, async fetch(req) { ... } });
+    // — so flagging it as an outbound SSRF sink is backwards: that handler
+    // *receives* requests. A definition is followed by its body `{`; a real
+    // call is followed by `;`, `.`, `,`, `)` or an operator.
+    const after = code.slice(end).match(/^\s*(.)/);
+    if (after && after[1] === "{") continue;
+    const before = code.slice(Math.max(0, m.index - 24), m.index);
+    if (/\b(?:async|function)\s+$/.test(before)) continue;
+
     const origInner = orig.slice(openIdx + 1, end);
     const oParts = splitTopLevel(origInner);
     const arg1 = (oParts[0] || "").trim();
@@ -867,6 +879,25 @@ function ruleSsrfFetch(orig, masked, file, findings) {
     const urlExpr = arg1 !== "" ? arg1 : urlField ? urlField[1].trim() : "";
     if (urlExpr === "") continue;
     if (classifyUrlExpr(urlExpr) === "safe") continue;
+
+    // HOISTED-LITERAL GUARD, mirroring MCP010's hoisted containment. Pulling a
+    // fixed endpoint out into a named constant is the *tidier* way to write it:
+    //     const LATEST_SOURCE = "https://example.dev/latest.ts";
+    //     await fetch(LATEST_SOURCE, { headers: { accept: "text/plain" } });
+    // Judging the identifier alone calls that an attacker-controlled origin.
+    // If the nearest assignment before this call is a plain string literal, the
+    // origin is as fixed as an inline literal.
+    if (/^[\w$]+$/.test(urlExpr)) {
+      const beforeSrc = orig.slice(0, m.index);
+      const assignRe = new RegExp(
+        `(?:\\b(?:const|let|var)\\s+${urlExpr}\\s*=|(?<![.\\w$])${urlExpr}\\s*=(?!=))([^;\\n]+)`,
+        "g",
+      );
+      let a;
+      let lastRhs = null;
+      while ((a = assignRe.exec(beforeSrc))) lastRhs = a[1];
+      if (lastRhs && classifyUrlExpr(lastRhs.trim()) === "safe") continue;
+    }
     const at = lineColAt(code, m.index);
     const sink = m[1] || `https.${m[3] || ""}`;
     findings.push(
