@@ -50,6 +50,9 @@ ARGUMENTS
 OPTIONS
   --json                 machine-readable JSON instead of the human report
   --sarif                SARIF v2.1.0 (GitHub code-scanning upload format)
+  --include-tests        also scan *.test.* / *.spec.* files and __tests__/
+                         __mocks__ directories (skipped by default: they are
+                         fixtures, not code the agent runs)
   --fail-on <severity>   exit non-zero if any finding is >= severity
                          (${VALID_GATES.join(" | ")}; default: high)
   --baseline <file>      diff against a committed baseline; only NEW findings
@@ -104,6 +107,7 @@ function parseArgs(argv) {
     else if (a === "--json") opts.json = true;
     else if (a === "--sarif") opts.sarif = true;
     else if (a === "--monitor-json") opts.monitorJson = true;
+    else if (a === "--include-tests") opts.includeTests = true;
     else if (a === "--quiet") opts.quiet = true;
     else if (a === "--no-color") opts.color = false;
     else if (a === "--color") opts.color = true;
@@ -169,7 +173,7 @@ async function run(argv, out, err) {
       dir = await new StubRegistrySource().materialize(t.value);
     }
 
-    const report = analyzeProject(dir);
+    const report = analyzeProject(dir, { includeTests: opts.includeTests });
 
     // --- baseline WRITE: persist current state, exit 0 (accept). ----------
     if (opts.baselineWrite !== null) {

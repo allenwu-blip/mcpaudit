@@ -32,6 +32,17 @@ const SKIP_DIRS = new Set([
   "vendor",
 ]);
 const MANIFEST_NAMES = new Set(["package.json", "mcp.json", "server.json"]);
+
+// Test and mock files are developer-authored fixtures, not code an agent will
+// execute at runtime. Scanning them is almost pure noise: on the official
+// modelcontextprotocol/servers repo, 19 of 47 findings came from `__tests__/`
+// alone. Skipped by default; `--include-tests` scans them anyway.
+const TEST_FILE_RE = /\.(test|spec)\.[cm]?[jt]sx?$/i;
+const TEST_DIR_RE = /(^|[\\/])(__tests__|__mocks__)([\\/]|$)/;
+function looksLikeTest(rel) {
+  return TEST_FILE_RE.test(rel) || TEST_DIR_RE.test(rel);
+}
+
 const MAX_FILE_BYTES = 2 * 1024 * 1024; // skip absurdly large/minified blobs
 const MAX_FILES = 5000;
 const MAX_DEPTH = 40; // pathological deep trees / symlink-ish loops guard
@@ -168,7 +179,7 @@ function safeRead(file, errors, { allowLarge = false } = {}) {
 
 /**
  * @param {string} rootDir absolute or relative path to an MCP server tree
- * @param {{ followManifestOnly?: boolean }} [opts]
+ * @param {{ followManifestOnly?: boolean, includeTests?: boolean }} [opts]
  * @returns {{ root:string, findings:Finding[], scannedFiles:string[], errors:string[] }}
  */
 export function analyzeProject(rootDir, opts = {}) {
@@ -228,6 +239,7 @@ export function analyzeProject(rootDir, opts = {}) {
     if (!SOURCE_EXT.has(dot)) continue;
     if (/\.min\.js$/.test(base) || /\.d\.ts$/.test(base) || /\.bundle\.js$/.test(base))
       continue;
+    if (!opts.includeTests && looksLikeTest(rel)) continue;
     const txt = safeRead(file, errors);
     if (txt == null) continue;
     if (looksMinified(txt)) {
