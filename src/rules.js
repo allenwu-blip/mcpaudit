@@ -1096,6 +1096,9 @@ function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
     const { firstArg } = scanCallArgs(code, openIdx);
     const p = firstArg.trim();
     if (p === "") continue; // pure literal path
+    // `fs.readFileSync(0, "utf8")` reads FILE DESCRIPTOR 0 — stdin. A numeric
+    // literal is not a path and cannot be traversed; only string paths can.
+    if (/^\d+$/.test(p)) continue;
     // Any path-module containment idiom anywhere in the path expression →
     // treat as handled (low-FP stance; see header).
     if (containmentRe.test(p)) continue;

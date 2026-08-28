@@ -39,7 +39,10 @@ const MANIFEST_NAMES = new Set(["package.json", "mcp.json", "server.json"]);
 // modelcontextprotocol/servers repo, 19 of 47 findings came from `__tests__/`
 // alone. Skipped by default; `--include-tests` scans them anyway.
 const TEST_FILE_RE = /\.(test|spec)\.[cm]?[jt]sx?$/i;
-const TEST_DIR_RE = /(^|[\\/])(__tests__|__mocks__)([\\/]|$)/;
+// Matched against the path RELATIVE to the scan root, so pointing the scanner
+// straight at `test/fixtures/some-server` still scans it normally — only a
+// `test/` directory *inside* the audited tree is skipped.
+const TEST_DIR_RE = /(^|[\\/])(__tests__|__mocks__|tests?|specs?|e2e)([\\/])/i;
 function looksLikeTest(rel) {
   return TEST_FILE_RE.test(rel) || TEST_DIR_RE.test(rel);
 }
