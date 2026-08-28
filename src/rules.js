@@ -322,36 +322,53 @@ function ruleCommandInjection(orig, masked, file, findings) {
     const openIdx = code.indexOf("(", site.at);
     if (openIdx < 0) continue;
     const { firstArg, fullArgs } = scanCallArgs(code, openIdx);
-    const isExecFile = /execFile/.test(fn);
     const firstKind = argIsNonLiteral(firstArg);
     const shellTrue = /shell\s*:\s*true/.test(fullArgs);
 
-    // execFile/execFileSync: program is arg1, dynamic values go in the argv
-    // array — the SAFE pattern. Only dangerous if the PROGRAM itself is
-    // non-literal, or shell:true is set with a non-literal anywhere.
-    if (isExecFile) {
-      const progDanger = firstKind === true; // a non-literal program name
-      const shellDanger = shellTrue && argIsNonLiteral(fullArgs) === true;
-      if (!progDanger && !shellDanger) continue;
+    // ARGV FORM vs SHELL FORM.
+    // `execFile`, and also `spawn`/`spawnSync`/`fork` when `shell: true` is
+    // NOT set, do not go through a shell: arg1 is the program path and every
+    // dynamic value travels in the argv array. That is the exact mitigation
+    // security guidance tells people to use instead of `exec()`, so reporting
+    // it as "command injection / would run arbitrary shell" is both wrong and
+    // insulting to a codebase that did the right thing. Only `exec`/`execSync`
+    // always parse arg1 as a shell command line.
+    const isArgvForm =
+      (/execFile/.test(fn) || /^(?:spawn|spawnSync|fork)$/.test(fn)) && !shellTrue;
+
+    let severity = "critical";
+    let message;
+    let remediation;
+
+    if (isArgvForm) {
+      // Args are safe by construction here; the only remaining question is
+      // who decides WHICH program runs.
+      if (firstKind !== true) continue;
+      // A zero-argument resolver (`getAdbPath()`, `resolveBinary()`) is the
+      // idiomatic way to locate a platform tool and is a far cry from a bare
+      // variable that might carry tool input. Report it, but not as critical.
+      const isResolverCall = /^[\w$]+(?:\s*\.\s*[\w$]+)*\s*\(\s*\)$/.test(firstArg.trim());
+      severity = isResolverCall ? "medium" : "high";
+      message =
+        `\`${fn}()\` runs a program whose PATH is non-literal. Arguments here go through the argv array, so there is no shell and no argument injection — ` +
+        (isResolverCall
+          ? "and the path comes from a resolver call, which is the normal way to locate a platform tool. Reported so you can confirm that resolver cannot be steered (PATH lookup, env var, or config an attacker can write), because whoever controls it controls which binary the agent executes."
+          : "but whoever controls this value controls which binary the agent executes. If it can be reached from MCP tool input, that is arbitrary program execution.");
+      remediation =
+        "Resolve the program from a fixed absolute path or an allowlist of known binaries; do not let tool input, `PATH`, or user-writable config decide which executable runs.";
     } else {
-      // exec/execSync/spawn/spawnSync/fork: arg1 is the command string.
+      // exec/execSync (always a shell), or anything with shell:true.
       const cmdDanger = firstKind === true;
       const shellDanger = shellTrue && argIsNonLiteral(fullArgs) === true;
       if (!cmdDanger && !shellDanger) continue;
+      message = `\`${fn}()\` is invoked with a non-literal command${shellTrue ? " (shell:true)" : ""}. If any interpolated/variable part can reach this from an MCP tool argument it is a command-injection sink — a tool the LLM calls would run arbitrary shell.`;
+      remediation =
+        "Use `execFile(cmd, [args])` with a fixed command string and an argv array (no shell). Strictly validate/allowlist any input; never interpolate tool input into a shell command.";
     }
 
     const at = lineColAt(code, openIdx);
     findings.push(
-      mkFinding(
-        "MCP001",
-        "critical",
-        file,
-        at.line,
-        at.col,
-        `\`${fn}()\` is invoked with a non-literal command${shellTrue ? " (shell:true)" : ""}. If any interpolated/variable part can reach this from an MCP tool argument it is a command-injection sink — a tool the LLM calls would run arbitrary shell.`,
-        "Use `execFile(cmd, [args])` with a fixed command string and an argv array (no shell). Strictly validate/allowlist any input; never interpolate tool input into a shell command.",
-        orig,
-      ),
+      mkFinding("MCP001", severity, file, at.line, at.col, message, remediation, orig),
     );
   }
 }
