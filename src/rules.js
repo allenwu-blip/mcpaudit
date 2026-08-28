@@ -625,8 +625,13 @@ function ruleUnpinnedRemoteExecSource(orig, masked, file, findings) {
 // The receiver group must also match `)` and `]`, because `getClients().set(k,v)`
 // and `arr[i].set(k,v)` are method calls too — capturing only bare identifiers
 // let those through as if they were free-standing `set(...)` calls.
+// `[!?]?` before the dot matters in TypeScript: a non-null assertion or an
+// optional chain sits between the receiver and the method —
+//     this.similarityMatrix.get(key)!.set(otherKey, similarity)
+// — and without it the receiver group fails to match at all, so a plain
+// `Map.set` was reported as a free-standing lodash-style `set(...)`.
 const POLLUTION_MERGE_FNS =
-  /(?:([A-Za-z_$][\w$]*|\)|\])\s*\.\s*)?\b(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
+  /(?:([A-Za-z_$][\w$]*|\)|\])\s*[!?]?\s*\.\s*)?\b(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
 
 // These names are also ordinary methods on Map/Set/WeakMap/TypedArray/URL-
 // SearchParams/Headers and on countless library objects. Matching them on any
@@ -648,9 +653,93 @@ const LODASH_RECEIVERS = new Set(["_", "lodash", "ld"]);
 
 const PROTO_TOKEN = /\b(__proto__|prototype|constructor)\b/;
 
+// `constructor` is also the keyword for a class's own constructor, which every
+// class in every OO codebase declares. Testing a whole FILE for `\bconstructor\b`
+// therefore succeeded on essentially every TypeScript file ever written, so the
+// "does this file show any prototype awareness" gate below gated nothing: it was
+// satisfied by `constructor() {` in 100% of the class files sampled across the
+// 12 servers scanned so far — including the file holding the one true positive,
+// which was firing by accident rather than on its own merits.
+// Strip member-position constructor DECLARATIONS before testing. A `.constructor`
+// property access is preceded by a dot and so is never stripped — that one is
+// real evidence.
+const CLASS_CTOR_DECL =
+  /(?:^|[\n;{}])[ \t]*(?:(?:public|private|protected|readonly|abstract|override|declare|static)[ \t]+)*constructor[ \t]*(?=\()/g;
+
+// `rawText` is the unmasked source. Masking blanks string literals, which
+// destroys the most explicit evidence there is — `o["__proto__"][k] = v` and
+// `if (k === "__proto__") return` both go blank. `__proto__` is specific
+// enough that its presence anywhere, string or comment, is real awareness;
+// `prototype`/`constructor` are not, so those are still read from masked code
+// only, where prose cannot reach them.
+function hasProtoAwareness(text, rawText) {
+  if (PROTO_TOKEN.test(text.replace(CLASS_CTOR_DECL, "\n"))) return true;
+  return rawText !== undefined && /__proto__/.test(rawText);
+}
+
+// Identifiers whose *name* says the value came from outside the process. In an
+// MCP server the tool handler's argument object is the attacker-controlled
+// surface, so a key rooted at one of these is the shape that actually matters:
+//     this.branches[input.branchId] = []
+// Deliberately tight. `data`, `options`, `config` and `opts` are left out: they
+// name internal state at least as often as external input, and admitting them
+// puts the noise straight back.
+const EXTERNAL_KEY_ROOTS = new Set([
+  "input",
+  "args",
+  "params",
+  "parameters",
+  "req",
+  "request",
+  "body",
+  "query",
+  "payload",
+  "userInput",
+  "toolInput",
+  "requestBody",
+  "rawInput",
+]);
+
+// A numeric key can never be `__proto__`. JS coerces a computed key to a string
+// and "0"/"17" are not the proto keys, so the entire numeric-array family —
+// `embedding[i]`, `matrix[i][j] = Math.min(...)`, `buffer[i]`, `data[y][x]` —
+// is not a pollution sink under any input. Lexically it is indistinguishable
+// from an object write, so we confirm the index is a literal number or a
+// visible `for` counter initialised to one.
+function isNumericKey(keyExpr, lines, li) {
+  const k = keyExpr.trim();
+  if (/^-?\d+$/.test(k)) return true;
+  if (!/^[\w$\s+\-*/%()]+$/.test(k)) return false; // no `.`, no strings, no calls
+  const ids = k.match(/[A-Za-z_$][\w$]*/g) || [];
+  if (!ids.length) return /^[-\d\s+*/%()]+$/.test(k); // pure arithmetic
+  const win = lines.slice(Math.max(0, li - 60), li + 1).join("\n");
+  return ids.every((id) =>
+    new RegExp(`for\\s*\\([^;)]*\\b(?:let|var|const)\\s+${id}\\s*=\\s*-?\\d`).test(
+      win,
+    ),
+  );
+}
+
+// Is the key visibly rooted at external input — either named as such, or bound
+// from something named as such within the preceding window?
+function keyIsExternal(keyExpr, lines, li) {
+  const root = /^[A-Za-z_$][\w$]*/.exec(keyExpr.trim())?.[0];
+  if (!root) return false;
+  if (EXTERNAL_KEY_ROOTS.has(root)) return true;
+  const win = lines.slice(Math.max(0, li - 40), li).join("\n");
+  const m = new RegExp(
+    `(?:const|let|var)\\s+(?:\\{[^}\\n]*\\b${root}\\b[^}\\n]*\\}|${root})\\s*=\\s*` +
+      `(?:await\\s+)?([A-Za-z_$][\\w$]*)` +
+      `|for\\s*\\([^)\\n]*\\b${root}\\b[^)\\n]*\\bof\\b[^)\\n]*?([A-Za-z_$][\\w$]*)\\s*[.)]`,
+  ).exec(win);
+  const from = m && (m[1] || m[2]);
+  return !!from && EXTERNAL_KEY_ROOTS.has(from);
+}
+
 function ruleProtoPollution(orig, masked, file, findings) {
   const { code } = masked;
   const lines = code.split("\n");
+  const rawLines = orig.split("\n");
 
   // (a) computed assignment whose lvalue is a dynamic property chain. We
   // require: a bracket-access lvalue with a non-literal (identifier) index,
@@ -661,7 +750,7 @@ function ruleProtoPollution(orig, masked, file, findings) {
   // BOTH a `]=`/`] =` computed-assign shape AND a proto token somewhere in
   // the (masked) file is required for the assignment to be reported, so
   // generic `arr[i]=x` never fires.
-  const fileHasProtoToken = PROTO_TOKEN.test(code);
+  const fileHasProtoToken = hasProtoAwareness(code, orig);
   for (let li = 0; li < lines.length; li++) {
     const L = lines[li];
     // Computed-assignment lvalue: `<expr>[ key ] = value` (not `==`).
@@ -694,17 +783,29 @@ function ruleProtoPollution(orig, masked, file, findings) {
     const seg = /\[([^\]\n]+)\]\s*=(?![=>])/.exec(L);
     const keyExpr = seg ? seg[1].trim() : "";
     const keyIsLiteral = keyExpr === ""; // masked: string literal → blank
-    const keyIsNumber = /^\d+$/.test(keyExpr);
-    const lineHasProto = PROTO_TOKEN.test(L);
-    // Fire only if: the assigned key is a non-literal (variable/expr) AND
-    // either this line names a proto token, or the file does (a recursive
-    // assignment helper in the same module). Numeric indices (arrays) and
-    // pure-literal keys never fire.
+    const keyIsNumber = isNumericKey(keyExpr, lines, li);
+    const lineHasProto = hasProtoAwareness(L, rawLines[li]);
+    // Fire only if the assigned key is a non-literal (variable/expr) AND we
+    // have some actual evidence it could be attacker-influenced. Numeric
+    // indices (arrays) and pure-literal keys never fire.
     if (keyIsLiteral || keyIsNumber) {
       if (!lineHasProto) continue;
     }
-    if (!(lineHasProto || (fileHasProtoToken && !keyIsLiteral && !keyIsNumber)))
-      continue;
+    // Two independent kinds of evidence, in descending confidence:
+    //   external — the key is visibly rooted at tool input, e.g.
+    //              `this.branches[input.branchId] = []`. This is the shape
+    //              worth a high; it is the one true positive in the corpus.
+    //   proto    — the file genuinely mentions `__proto__`/`prototype`/
+    //              `.constructor`, so it is doing something with the proto
+    //              chain and a dynamic write here deserves a look. We cannot
+    //              see where the key came from, so this is a medium, not a
+    //              high — claiming high on "the file says prototype somewhere"
+    //              is the overreach that produced 57 findings in one repo.
+    const external =
+      !keyIsLiteral && !keyIsNumber && keyIsExternal(keyExpr, lines, li);
+    const protoEvidence =
+      lineHasProto || (fileHasProtoToken && !keyIsLiteral && !keyIsNumber);
+    if (!(external || protoEvidence)) continue;
     // ALLOWLIST-GUARDED KEY. The idiomatic safe form of a computed assignment
     // is to check the key against a fixed set first:
     //     if (FORWARDABLE_REQUEST_HEADERS.has(name.toLowerCase())) {
@@ -717,15 +818,72 @@ function ruleProtoPollution(orig, masked, file, findings) {
     let guarded = null;
     if (keyId) {
       const win = lines.slice(Math.max(0, li - 25), li).join("\n");
+      const rawWin = rawLines.slice(Math.max(0, li - 25), li).join("\n");
       const allow = new RegExp(
         `([\\w$.]+)\\s*\\.\\s*(?:has|includes|hasOwnProperty)\\s*\\(\\s*${keyId}\\b`,
       ).exec(win);
+      // `Object.hasOwn(obj, key)` is the modern spelling of the same guard and
+      // takes its arguments the other way round, so the receiver-first pattern
+      // above never matched it. Recognising `hasOwnProperty` but not `hasOwn`
+      // rewards the legacy form and reports the one MDN recommends.
+      const hasOwn = new RegExp(
+        `Object\\s*\\.\\s*hasOwn\\s*\\(\\s*([\\w$.]+)\\s*,\\s*${keyId}\\b`,
+      ).exec(win);
       if (allow) guarded = allow[1];
+      else if (hasOwn) guarded = `Object.hasOwn(${hasOwn[1]}, …)`;
+      // An explicit comparison against `__proto__`, either way round. The old
+      // form of this test was `__proto__[\s\S]{0,40}${keyId}` — mere proximity,
+      // which counts an unrelated `const BAD = '__proto__'` two lines up as if
+      // it were a guard. A guard is a comparison, so require one.
       else if (
-        new RegExp(`${keyId}\\s*[!=]==?\\s*["'\`]?__proto__`).test(win) ||
-        new RegExp(`__proto__[\\s\\S]{0,40}${keyId}\\b`).test(win)
+        new RegExp(`${keyId}\\s*[!=]==?\\s*["'\`]?__proto__`).test(rawWin) ||
+        new RegExp(`__proto__["'\`]?\\s*[!=]==?\\s*${keyId}\\b`).test(rawWin)
       ) {
         guarded = "an explicit __proto__ check";
+      } else {
+        // A named validator called on the key just above. Read its body in the
+        // same file rather than trusting the name — the same treatment MCP010
+        // gives path validators. This is what `assertSafeCompanyId(companyId)`
+        // guarding `RESERVED_KEYS = new Set(['__proto__', …])` looks like, and
+        // without it the reserved-key set is read as evidence of danger rather
+        // than as the mitigation it is.
+        const vcall = new RegExp(
+          `(?:^|[\\n;{}])\\s*(?:await\\s+)?(?:[\\w$]+\\s*\\.\\s*)?([\\w$]+)\\s*\\(\\s*${keyId}\\s*\\)`,
+        ).exec(win);
+        if (vcall) {
+          const fn = vcall[1];
+          const defRe = new RegExp(
+            `function\\s+${fn}\\s*\\(` +
+              `|(?:const|let|var)\\s+${fn}\\s*=` +
+              `|[\\n;{]\\s*(?:(?:private|public|protected|static|async|readonly)\\s+)*${fn}\\s*\\(`,
+          );
+          const d = defRe.exec(orig);
+          if (d) {
+            const body = orig.slice(d.index, d.index + 600);
+            if (/__proto__|["'`]prototype["'`]|["'`]constructor["'`]/.test(body)) {
+              guarded = fn;
+            } else {
+              // One hop further. The validator usually does not spell the keys
+              // itself — it defers to a named set, and THAT is where the proto
+              // keys live:
+              //     const RESERVED_KEYS = new Set(['__proto__', …]);
+              //     function assertSafeCompanyId(id) {
+              //       if (RESERVED_KEYS.has(id)) throw …
+              // Stopping at the validator body misses the whole idiom, so
+              // resolve the set it consults and look there. One hop only.
+              const viaSet = /([A-Za-z_$][\w$]*)\s*\.\s*(?:has|includes)\s*\(/.exec(
+                body,
+              );
+              if (viaSet) {
+                const sd = new RegExp(
+                  `(?:const|let|var)\\s+${viaSet[1]}\\s*=`,
+                ).exec(orig);
+                if (sd && /__proto__/.test(orig.slice(sd.index, sd.index + 200)))
+                  guarded = `${fn}() via ${viaSet[1]}`;
+              }
+            }
+          }
+        }
       }
     }
 
@@ -733,14 +891,16 @@ function ruleProtoPollution(orig, masked, file, findings) {
     findings.push(
       mkFinding(
         "MCP007",
-        guarded ? "low" : "high",
+        guarded ? "low" : external ? "high" : "medium",
         file,
         li + 1,
         col > 0 ? col : 1,
         "Computed property assignment with an attacker-influenceable key (a recursive/dynamic `obj[key] = value` reachable from tool input where `key` can be `__proto__`/`constructor`/`prototype`). This is a prototype-pollution sink: poisoning `Object.prototype` can corrupt every object in the process and is a common RCE/auth-bypass primitive." +
           (guarded
             ? ` Reported at LOW: the key looks allowlist-guarded by \`${guarded}\` just above this assignment, which is the correct defence. mcpaudit cannot see what that set contains, so confirm \`__proto__\`, \`constructor\` and \`prototype\` are not in it.`
-            : ""),
+            : external
+              ? ""
+              : " Reported at MEDIUM rather than HIGH: this file references the prototype chain, but mcpaudit cannot see where the key comes from. If it is an internal identifier rather than tool input, this is not exploitable."),
         "Reject keys equal to `__proto__`, `prototype`, or `constructor`; use a `Map`, `Object.create(null)`, or `Object.defineProperty` with `Object.hasOwn` guards. Validate tool input against a strict schema before using it as an object key.",
         orig,
       ),
@@ -764,7 +924,25 @@ function ruleProtoPollution(orig, masked, file, findings) {
     }
     const openIdx = code.indexOf("(", mm.index);
     if (openIdx < 0) continue;
-    const { fullArgs } = scanCallArgs(code, openIdx);
+    const { fullArgs, end } = scanCallArgs(code, openIdx);
+    // A DECLARATION is not a call. Both of these parse here as a bare
+    // `set(...)` invocation carrying two non-literal arguments:
+    //     public set(key: K, value: V, ttlMs?: number): void {
+    //     set(\n  key: string,\n  value: string,\n  size: number\n): void {
+    // Three independent tells, any one of which settles it: the parameter list
+    // carries type annotations; a function body opens right after the closing
+    // paren; or a member modifier sits immediately before the name.
+    const paramList = splitTopLevel(fullArgs).some((p) =>
+      /^(?:\.\.\.)?[\w$]+\??\s*:\s*\S/.test(p.trim()),
+    );
+    const bodyFollows = /^\s*(?::\s*[^;={]{1,80})?\{/.test(
+      code.slice(end + 1, end + 120),
+    );
+    const declModifier =
+      /(?:^|[\n;{}])[ \t]*(?:(?:public|private|protected|readonly|abstract|override|declare|static|async)[ \t]+)+\*?[ \t]*$|\bfunction[ \t]+$/.test(
+        code.slice(Math.max(0, mm.index - 60), mm.index),
+      );
+    if (paramList || bodyFollows || declModifier) continue;
     // A literal-only merge (e.g. `_.merge(a, { fixed: 1 })`) masks the object
     // text away but keeps `{}` / identifiers. Require a bare identifier
     // source argument (the classic `merge(target, untrustedInput)` shape):

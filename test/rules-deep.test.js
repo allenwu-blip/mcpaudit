@@ -113,6 +113,173 @@ describe("MCP007 prototype pollution", () => {
     // Object.assign is shallow and not in the recursive-merge sink list.
     expect(byRule(analyzeSource(code, "ok3.js"), "MCP007")).toHaveLength(0);
   });
+
+  // -- the `constructor` gate, found scanning ooples/token-optimizer-mcp ------
+  // `\bconstructor\b` as a file-level "does this code touch the proto chain"
+  // signal is satisfied by the class constructor that every OO file declares.
+  // It gated nothing, and it was the ONLY reason the corpus's one true
+  // positive fired. Evidence must now be a real proto reference or a key
+  // visibly rooted at tool input.
+
+  it("fires HIGH when the key is rooted at tool input, with no proto token", () => {
+    const code = [
+      "class Server {",
+      "  constructor() { this.branches = {}; }",
+      "  process(input) { this.branches[input.branchId] = []; }",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "tp.ts"), "MCP007");
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("high");
+    expect(f[0].line).toBe(3);
+  });
+
+  it("does NOT fire when a class constructor is the only proto token", () => {
+    const code = [
+      "class Counter {",
+      "  constructor() { this.byLevel = {}; }",
+      "  tally(entry) { this.byLevel[entry.level] = 1; }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "ctor.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("downgrades to MEDIUM when the file is proto-aware but the key is opaque", () => {
+    const code = [
+      "const BAD = '__proto__';",
+      "function copy(dst, src, k) { dst[k] = src[k]; }",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "med.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("medium");
+  });
+
+  it("does NOT fire on a for-counter index into a numeric array", () => {
+    const code = [
+      "class Embed {",
+      "  constructor() {}",
+      "  build(n, hash) {",
+      "    const embedding = [];",
+      "    for (let i = 0; i < n; i++) { embedding[i] = hash[i] / 127.5 - 1; }",
+      "    return embedding;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "num.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a Levenshtein matrix write", () => {
+    const code = [
+      "class D {",
+      "  constructor() {}",
+      "  dist(a, b) {",
+      "    const matrix = [];",
+      "    for (let i = 1; i <= a; i++) {",
+      "      for (let j = 1; j <= b; j++) { matrix[i][j] = matrix[i - 1][j] + 1; }",
+      "    }",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "lev.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  // -- a declaration is not a call -------------------------------------------
+
+  it("does NOT fire on a `set` METHOD DECLARATION with typed parameters", () => {
+    const code = [
+      "class LRU {",
+      "  public set(key: K, value: V, ttlMs?: number): void {",
+      "    this.cache.set(key, value);",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "lru.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a multi-line `set(` declaration", () => {
+    const code = [
+      "class Engine {",
+      "  set(",
+      "    key: string,",
+      "    value: string,",
+      "    size: number",
+      "  ): void {",
+      "    this.store[key] = value;",
+      "  }",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "eng.ts"), "MCP007");
+    // The declaration itself must not fire; `this.store[key] = value` has no
+    // proto evidence and no external root either, so the file is silent.
+    expect(f).toHaveLength(0);
+  });
+
+  it("still fires on a genuine bare lodash-style set(obj, path, value)", () => {
+    const code = "import { set } from 'lodash';\nfunction f(o, p, v) { set(o, p, v); }";
+    const f = byRule(analyzeSource(code, "ls.js"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("high");
+  });
+
+  // -- receiver capture across a TS non-null assertion ------------------------
+
+  // -- the guard must not be read as the danger, found scanning freee-mcp -----
+
+  it("downgrades to LOW behind Object.hasOwn(obj, key)", () => {
+    const code = [
+      "async function add(config, companyId) {",
+      "  if (!Object.hasOwn(config.companies, companyId)) {",
+      "    config.companies[companyId] = { id: companyId };",
+      "  }",
+      "}",
+      "const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "hasown.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("low");
+  });
+
+  it("downgrades to LOW behind a same-file validator that rejects proto keys", () => {
+    // The validator sits outside the 25-line lookback, as it does in the real
+    // freee-mcp file — so the direct `RESERVED_KEYS.has(...)` branch cannot
+    // see it and the finding rests entirely on reading the validator's body.
+    const code = [
+      "const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);",
+      "function assertSafeCompanyId(companyId) {",
+      "  if (RESERVED_KEYS.has(companyId)) throw new Error('bad id');",
+      "}",
+      ...Array(30).fill("// filler"),
+      "function add(config, companyId) {",
+      "  assertSafeCompanyId(companyId);",
+      "  config.companies[companyId] = { id: companyId };",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "validator.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("low");
+    expect(f[0].message).toMatch(/assertSafeCompanyId/);
+  });
+
+  it("does NOT downgrade for a same-name call whose body never mentions proto", () => {
+    const code = [
+      "const BAD = '__proto__';",
+      "function trim(k) { return k.trim(); }",
+      "function add(o, k, v) { trim(k); o[k] = v; }",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "nodowngrade.ts"), "MCP007");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).not.toBe("low");
+  });
+
+  it("does NOT fire on Map.set reached through a `!` non-null assertion", () => {
+    const code = [
+      "class P {",
+      "  constructor() { this.m = new Map(); }",
+      "  link(k, other, sim) { this.m.get(k)!.set(other, sim); }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "map.ts"), "MCP007")).toHaveLength(0);
+  });
 });
 
 describe("MCP008 SSRF-able fetch", () => {
