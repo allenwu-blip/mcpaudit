@@ -1144,6 +1144,26 @@ function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
       // the finding stays visible but drops out of `--fail-on high` and stops
       // crowding out real signal. (The official MCP `filesystem` server hits
       // this: 13 findings, all `validatePath()` output, all noise at `high`.)
+      // VALIDATE-THEN-USE. The assignment form (`const p = validatePath(x)`) is
+      // only half of it; the other half is far more common in MCP tool
+      // handlers, where the path arrives destructured straight out of the
+      // schema and is checked in place:
+      //     async ({ saveTo }) => {
+      //       validateFileExtension(saveTo, ALLOWED, "save_screenshot");
+      //       validateOutputPath(saveTo);
+      //       fs.writeFileSync(saveTo, screenshot);
+      //     }
+      // Nothing is ever assigned, so looking only at assignments missed it.
+      // Bounded look-back approximates "earlier in this function".
+      if (!viaValidator) {
+        const win = before.slice(-2000);
+        const guardRe = new RegExp(
+          `\\b((?:validate|sanitiz|assert|ensure|check|guard|verif|secure|safe)[\\w$]*)\\s*\\(\\s*${p}\\b`,
+          "i",
+        );
+        const g = guardRe.exec(win);
+        if (g) viaValidator = g[1];
+      }
       if (lastRhs) {
         const v = VALIDATOR_CALL_RE.exec(lastRhs);
         if (v) viaValidator = v[1];
@@ -1169,7 +1189,7 @@ function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
         at.col,
         `\`${typeof fn === "string" ? fn : "fs call"}\` uses a non-literal path. In an MCP file tool reachable from tool input, an attacker can supply \`../../../etc/passwd\` (or an absolute path) and read or overwrite files outside the intended directory — path traversal / arbitrary file access.` +
           (viaValidator
-            ? ` Reported at LOW: the path comes from \`${viaValidator}()\`, which looks like a project-local path validator. mcpaudit does no taint tracking and cannot verify what that function actually enforces — confirm it resolves symlinks and asserts containment against an allowlist before treating this as handled.`
+            ? ` Reported at LOW: this path is guarded by \`${viaValidator}()\` — either assigned from it, or passed to it earlier in this function — which looks like a project-local path validator. mcpaudit does no taint tracking and cannot verify what that function actually enforces; confirm it resolves symlinks and asserts containment against an allowlist before treating this as handled.`
             : ""),
         "Resolve the path and assert it stays inside an allowed base dir (`const full = path.resolve(BASE, p); if (!full.startsWith(BASE + path.sep)) throw`), or reduce to `path.basename(p)` when only a filename is expected.",
         orig,
