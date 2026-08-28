@@ -391,7 +391,23 @@ function ruleEnvExfiltration(orig, masked, file, findings) {
     if (!/process\.env\b/.test(cLine)) continue; // comment/static-string only
 
     const inText = /\btext\s*:/.test(cLine);
-    const inReturn = /\breturn\b/.test(cLine);
+
+    // `inReturn` used to be "this line contains the word return", which is not
+    // the same thing as "the returned value contains process.env":
+    //     if (process.env.MODE === 'off') return 'off:mode';   // returns a literal
+    //     return process.env.NODE_ENV === 'development';        // returns a boolean
+    //     return !!process.env.OPENAI_API_KEY;                  // returns a boolean
+    // The first leaks nothing (env is in the *condition*); the other two leak
+    // only whether a variable is set, not its value. Across seven real MCP
+    // servers this shape was the single largest MCP002 false-positive source.
+    const retIdx = cLine.search(/\breturn\b/);
+    const returned = retIdx >= 0 ? cLine.slice(retIdx + 6) : "";
+    const envIsReturned = /process\.env\b/.test(returned);
+    // A comparison or coercion yields a boolean, not the secret itself.
+    const returnsBoolean =
+      /(?:[=!]==?|\bin\b)\s*[^=]|^\s*!!|\bBoolean\s*\(/.test(returned) &&
+      !/\btext\s*:/.test(returned);
+    const inReturn = envIsReturned && !returnsBoolean;
     const inToolCall =
       /\.(tool|registerTool|setRequestHandler|prompt|resource)\s*\(/.test(
         cLine,
@@ -411,14 +427,23 @@ function ruleEnvExfiltration(orig, masked, file, findings) {
       : inToolCall
         ? "a tool/handler declaration (e.g. its description)"
         : "a returned value";
+    // `text:` and a tool declaration are unambiguously model-visible. A plain
+    // `return process.env.X` is not: lexically, a config getter
+    // (`return process.env.LOG_DIR`) and a tool handler that hands the value
+    // to the model are the same shape, and the former is far more common.
+    // Report it, but do not let it dominate a `--fail-on high` gate.
+    const bareReturn = !inText && !inToolCall;
     findings.push(
       mkFinding(
         "MCP002",
-        "high",
+        bareReturn ? "medium" : "high",
         file,
         li + 1,
         col,
-        `\`process.env\` is placed into ${where}, which is visible to the LLM. Environment variables routinely hold API keys, tokens and DB URLs; exposing them to the model leaks credentials into its context (and any logs/telemetry of the conversation).`,
+        `\`process.env\` is placed into ${where}, which is visible to the LLM. Environment variables routinely hold API keys, tokens and DB URLs; exposing them to the model leaks credentials into its context (and any logs/telemetry of the conversation).` +
+          (bareReturn
+            ? " Reported at MEDIUM: this is a bare `return`, and a config getter looks identical to a tool handler at this level of analysis. If this function only feeds internal configuration, ignore it."
+            : ""),
         "Never return `process.env` (or whole config objects) to the model. Return only the specific, non-secret fields the tool needs; read secrets into local variables used solely for outbound auth.",
         orig,
       ),
@@ -597,8 +622,11 @@ function ruleUnpinnedRemoteExecSource(orig, masked, file, findings) {
 // Capture an optional receiver so we can tell `_.set(o, path, v)` (a lodash
 // deep-set — a real pollution sink) from `map.set(k, v)` (a Map write, which
 // cannot reach Object.prototype at all).
+// The receiver group must also match `)` and `]`, because `getClients().set(k,v)`
+// and `arr[i].set(k,v)` are method calls too — capturing only bare identifiers
+// let those through as if they were free-standing `set(...)` calls.
 const POLLUTION_MERGE_FNS =
-  /(?:([A-Za-z_$][\w$]*)\s*\.\s*)?\b(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
+  /(?:([A-Za-z_$][\w$]*|\)|\])\s*\.\s*)?\b(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
 
 // These names are also ordinary methods on Map/Set/WeakMap/TypedArray/URL-
 // SearchParams/Headers and on countless library objects. Matching them on any
@@ -636,8 +664,17 @@ function ruleProtoPollution(orig, masked, file, findings) {
   const fileHasProtoToken = PROTO_TOKEN.test(code);
   for (let li = 0; li < lines.length; li++) {
     const L = lines[li];
-    // computed-assignment lvalue: ...[ <something non-empty> ] = (not ==)
-    const m = /\[[^\]\n]+\]\s*=(?!=)/.exec(L);
+    // Computed-assignment lvalue: `<expr>[ key ] = value` (not `==`).
+    // The leading `[\w$)\]]` matters: without it this also matched ARRAY
+    // DESTRUCTURING, which is everywhere in modern JS and has nothing to do
+    // with prototype pollution —
+    //     const [a, b] = ipv4Parts.map(Number);
+    //     const [clientId, clientSecret] = credentials.split(':');
+    //     const [, existing] = await Promise.all([...]);
+    // — as well as TypeScript tuple annotations like `): [string, T] =>`.
+    // A real computed assignment always has an object expression immediately
+    // before the bracket: an identifier, a `)`, or a `]`.
+    const m = /[\w$)\]]\s*\[[^\]\n]+\]\s*=(?!=)/.exec(L);
     if (!m) continue;
     const idx = L.slice(L.indexOf("[", m.index === 0 ? 0 : 0));
     // crude: the bracket segment just before `=`
