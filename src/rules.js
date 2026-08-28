@@ -705,15 +705,42 @@ function ruleProtoPollution(orig, masked, file, findings) {
     }
     if (!(lineHasProto || (fileHasProtoToken && !keyIsLiteral && !keyIsNumber)))
       continue;
+    // ALLOWLIST-GUARDED KEY. The idiomatic safe form of a computed assignment
+    // is to check the key against a fixed set first:
+    //     if (FORWARDABLE_REQUEST_HEADERS.has(name.toLowerCase())) {
+    //       forwardedHeaders[name] = value;
+    //     }
+    // `__proto__` cannot reach the assignment unless somebody put it in the
+    // allowlist. An explicit `key === '__proto__'` rejection counts too.
+    // Downgrade rather than suppress: we can see a guard, not what is in it.
+    const keyId = /^[\w$]+/.exec(keyExpr || "")?.[0];
+    let guarded = null;
+    if (keyId) {
+      const win = lines.slice(Math.max(0, li - 25), li).join("\n");
+      const allow = new RegExp(
+        `([\\w$.]+)\\s*\\.\\s*(?:has|includes|hasOwnProperty)\\s*\\(\\s*${keyId}\\b`,
+      ).exec(win);
+      if (allow) guarded = allow[1];
+      else if (
+        new RegExp(`${keyId}\\s*[!=]==?\\s*["'\`]?__proto__`).test(win) ||
+        new RegExp(`__proto__[\\s\\S]{0,40}${keyId}\\b`).test(win)
+      ) {
+        guarded = "an explicit __proto__ check";
+      }
+    }
+
     const col = L.indexOf("[", m.index >= 0 ? 0 : 0) + 1;
     findings.push(
       mkFinding(
         "MCP007",
-        "high",
+        guarded ? "low" : "high",
         file,
         li + 1,
         col > 0 ? col : 1,
-        "Computed property assignment with an attacker-influenceable key (a recursive/dynamic `obj[key] = value` reachable from tool input where `key` can be `__proto__`/`constructor`/`prototype`). This is a prototype-pollution sink: poisoning `Object.prototype` can corrupt every object in the process and is a common RCE/auth-bypass primitive.",
+        "Computed property assignment with an attacker-influenceable key (a recursive/dynamic `obj[key] = value` reachable from tool input where `key` can be `__proto__`/`constructor`/`prototype`). This is a prototype-pollution sink: poisoning `Object.prototype` can corrupt every object in the process and is a common RCE/auth-bypass primitive." +
+          (guarded
+            ? ` Reported at LOW: the key looks allowlist-guarded by \`${guarded}\` just above this assignment, which is the correct defence. mcpaudit cannot see what that set contains, so confirm \`__proto__\`, \`constructor\` and \`prototype\` are not in it.`
+            : ""),
         "Reject keys equal to `__proto__`, `prototype`, or `constructor`; use a `Map`, `Object.create(null)`, or `Object.defineProperty` with `Object.hasOwn` guards. Validate tool input against a strict schema before using it as an object key.",
         orig,
       ),
