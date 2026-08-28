@@ -577,8 +577,30 @@ function ruleUnpinnedRemoteExecSource(orig, masked, file, findings) {
 // AND a non-literal argument. A pure literal merge target does not fire.
 // ---------------------------------------------------------------------------
 
+// Capture an optional receiver so we can tell `_.set(o, path, v)` (a lodash
+// deep-set — a real pollution sink) from `map.set(k, v)` (a Map write, which
+// cannot reach Object.prototype at all).
 const POLLUTION_MERGE_FNS =
-  /\b(_\s*\.\s*)?(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
+  /(?:([A-Za-z_$][\w$]*)\s*\.\s*)?\b(merge|mergeWith|defaultsDeep|set|setWith|assignIn|assignInWith|extend|extendWith|mixin|deepmerge|deepMerge|deepAssign|defaults)\s*\(/g;
+
+// These names are also ordinary methods on Map/Set/WeakMap/TypedArray/URL-
+// SearchParams/Headers and on countless library objects. Matching them on any
+// receiver made this rule fire on `transports.set(sessionId, t)` and
+// `buffer.set(chunk, offset)` — the single largest false-positive source in
+// the ruleset. For these names we require either a bare call (an imported
+// `set`/`merge`) or an explicit lodash-style receiver.
+const AMBIGUOUS_SINK_NAMES = new Set([
+  "set",
+  "setWith",
+  "extend",
+  "extendWith",
+  "defaults",
+  "mixin",
+  "assignIn",
+  "assignInWith",
+]);
+const LODASH_RECEIVERS = new Set(["_", "lodash", "ld"]);
+
 const PROTO_TOKEN = /\b(__proto__|prototype|constructor)\b/;
 
 function ruleProtoPollution(orig, masked, file, findings) {
@@ -635,7 +657,17 @@ function ruleProtoPollution(orig, masked, file, findings) {
   let mm;
   POLLUTION_MERGE_FNS.lastIndex = 0;
   while ((mm = POLLUTION_MERGE_FNS.exec(code))) {
+    const receiver = mm[1]; // undefined for a bare `merge(a, b)` call
     const fnName = mm[2];
+    // `map.set(k, v)` / `buf.set(chunk, off)` are not deep merges. Only a bare
+    // call or a lodash-style receiver can be the deep-set we care about.
+    if (
+      AMBIGUOUS_SINK_NAMES.has(fnName) &&
+      receiver !== undefined &&
+      !LODASH_RECEIVERS.has(receiver)
+    ) {
+      continue;
+    }
     const openIdx = code.indexOf("(", mm.index);
     if (openIdx < 0) continue;
     const { fullArgs } = scanCallArgs(code, openIdx);
@@ -894,6 +926,13 @@ function ruleHardcodedSecret(orig, masked, file, findings) {
 const FS_PATH_SINKS =
   /\bfs(?:\s*\.\s*promises)?\s*\.\s*(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|unlink|unlinkSync|rm|rmSync|readdir|readdirSync|createReadStream|createWriteStream|open|openSync|copyFile|copyFileSync)\s*\(|\b(readFile|writeFile|appendFile|unlink|rm|readdir|copyFile)\s*\(/g;
 
+// A project-local path validator, by naming convention: `validatePath`,
+// `ensureInsideRoot`, `sanitizePath`, `assertSafePath`, `checkPath`, … We
+// cannot verify what these enforce (no taint tracking), so a hit here
+// DOWNGRADES the finding rather than suppressing it.
+const VALIDATOR_CALL_RE =
+  /\b(?:await\s+)?(?:[\w$]+\s*\.\s*)?((?:validate|sanitiz|assert|ensure|check|guard|verif|secure|safe)[\w$]*)\s*\(/i;
+
 function rulefsPathTraversal(orig, masked, file, findings) {
   const { code } = masked;
   // require an fs binding so a random `readFile(` helper on another object is
@@ -934,6 +973,7 @@ function rulefsPathTraversal(orig, masked, file, findings) {
     // fires; see the MCP010 STILL-fires-on-a-hoisted-variable test.) This
     // mirrors the in-arg containment skip above; favor a false negative over
     // cry-wolf, consistent with the project ethos + README Limitations.
+    let viaValidator = null;
     if (!isConcat && /^[\w$]+$/.test(p)) {
       const before = code.slice(0, m.index);
       const assignRe = new RegExp(
@@ -949,16 +989,31 @@ function rulefsPathTraversal(orig, masked, file, findings) {
       ) {
         continue; // hoisted containment — handled, do not fire
       }
+      // SOFT containment: the value came out of a project-local validator
+      // (`validatePath`, `ensureInsideRoot`, `sanitizePath`, …). Without taint
+      // tracking we cannot prove what that function enforces, so we must NOT
+      // suppress — silently dropping a path-traversal finding is exactly the
+      // failure mode a security scanner cannot afford. We downgrade instead:
+      // the finding stays visible but drops out of `--fail-on high` and stops
+      // crowding out real signal. (The official MCP `filesystem` server hits
+      // this: 13 findings, all `validatePath()` output, all noise at `high`.)
+      if (lastRhs) {
+        const v = VALIDATOR_CALL_RE.exec(lastRhs);
+        if (v) viaValidator = v[1];
+      }
     }
     const at = lineColAt(code, m.index);
     findings.push(
       mkFinding(
         "MCP010",
-        "high",
+        viaValidator ? "low" : "high",
         file,
         at.line,
         at.col,
-        `\`${typeof fn === "string" ? fn : "fs call"}\` uses a non-literal path. In an MCP file tool reachable from tool input, an attacker can supply \`../../../etc/passwd\` (or an absolute path) and read or overwrite files outside the intended directory — path traversal / arbitrary file access.`,
+        `\`${typeof fn === "string" ? fn : "fs call"}\` uses a non-literal path. In an MCP file tool reachable from tool input, an attacker can supply \`../../../etc/passwd\` (or an absolute path) and read or overwrite files outside the intended directory — path traversal / arbitrary file access.` +
+          (viaValidator
+            ? ` Reported at LOW: the path comes from \`${viaValidator}()\`, which looks like a project-local path validator. mcpaudit does no taint tracking and cannot verify what that function actually enforces — confirm it resolves symlinks and asserts containment against an allowlist before treating this as handled.`
+            : ""),
         "Resolve the path and assert it stays inside an allowed base dir (`const full = path.resolve(BASE, p); if (!full.startsWith(BASE + path.sep)) throw`), or reduce to `path.basename(p)` when only a filename is expected.",
         orig,
       ),
