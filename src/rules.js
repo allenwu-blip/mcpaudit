@@ -676,6 +676,19 @@ function ruleProtoPollution(orig, masked, file, findings) {
     // before the bracket: an identifier, a `)`, or a `]`.
     const m = /[\w$)\]]\s*\[[^\]\n]+\]\s*=(?!=)/.exec(L);
     if (!m) continue;
+    // `[\w$)\]]` alone is not enough: the `t` of `const` is a word character,
+    // so `const [a, b] = x` still matched. Reject when the token immediately
+    // before the bracket is a keyword that introduces a binding or an
+    // expression rather than an object being indexed.
+    const lead = /([A-Za-z_$][\w$]*)\s*\[[^\]\n]+\]\s*=(?!=)/.exec(L);
+    if (
+      lead &&
+      /^(?:const|let|var|return|of|in|await|typeof|case|yield|new|delete|void|do|else)$/.test(
+        lead[1],
+      )
+    ) {
+      continue;
+    }
     const idx = L.slice(L.indexOf("[", m.index === 0 ? 0 : 0));
     // crude: the bracket segment just before `=`
     const seg = /\[([^\]\n]+)\]\s*=(?!=)/.exec(L);
