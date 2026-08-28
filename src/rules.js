@@ -674,13 +674,13 @@ function ruleProtoPollution(orig, masked, file, findings) {
     // — as well as TypeScript tuple annotations like `): [string, T] =>`.
     // A real computed assignment always has an object expression immediately
     // before the bracket: an identifier, a `)`, or a `]`.
-    const m = /[\w$)\]]\s*\[[^\]\n]+\]\s*=(?!=)/.exec(L);
+    const m = /[\w$)\]]\s*\[[^\]\n]+\]\s*=(?![=>])/.exec(L);
     if (!m) continue;
     // `[\w$)\]]` alone is not enough: the `t` of `const` is a word character,
     // so `const [a, b] = x` still matched. Reject when the token immediately
     // before the bracket is a keyword that introduces a binding or an
     // expression rather than an object being indexed.
-    const lead = /([A-Za-z_$][\w$]*)\s*\[[^\]\n]+\]\s*=(?!=)/.exec(L);
+    const lead = /([A-Za-z_$][\w$]*)\s*\[[^\]\n]+\]\s*=(?![=>])/.exec(L);
     if (
       lead &&
       /^(?:const|let|var|return|of|in|await|typeof|case|yield|new|delete|void|do|else)$/.test(
@@ -691,7 +691,7 @@ function ruleProtoPollution(orig, masked, file, findings) {
     }
     const idx = L.slice(L.indexOf("[", m.index === 0 ? 0 : 0));
     // crude: the bracket segment just before `=`
-    const seg = /\[([^\]\n]+)\]\s*=(?!=)/.exec(L);
+    const seg = /\[([^\]\n]+)\]\s*=(?![=>])/.exec(L);
     const keyExpr = seg ? seg[1].trim() : "";
     const keyIsLiteral = keyExpr === ""; // masked: string literal → blank
     const keyIsNumber = /^\d+$/.test(keyExpr);
@@ -1213,8 +1213,26 @@ function rulefsPathTraversal(orig, masked, file, findings, cfg, stats) {
 const UNSAFE_DESERIALIZE =
   /(?<![.\w$])(unserialize|deserialize)\s*\(|\b(yaml|jsyaml|YAML|jsYaml)\s*\.\s*load\s*\(|(?<![.\w$])load\s*\(/g;
 
-function ruleUnsafeDeserialize(orig, masked, file, findings) {
+/**
+ * js-yaml 4 removed `safeLoad` and made `load` itself safe: it defaults to the
+ * DEFAULT_SCHEMA, which cannot instantiate arbitrary JS types. The dangerous
+ * full-schema behaviour this rule was written for belongs to js-yaml 3.x and
+ * earlier. Flagging `yaml.load` in a project that depends on ^4 is reporting a
+ * vulnerability that the dependency fixed years ago.
+ *
+ * @param {Record<string,string>|undefined} deps dependency ranges from package.json
+ * @returns {boolean} true when js-yaml is pinned to 4 or newer
+ */
+function yamlLoadIsSafe(deps) {
+  const range = deps?.["js-yaml"];
+  if (typeof range !== "string") return false;
+  const major = /(\d+)/.exec(range);
+  return Boolean(major) && Number(major[1]) >= 4;
+}
+
+function ruleUnsafeDeserialize(orig, masked, file, findings, deps) {
   const { code } = masked;
+  const yamlSafe = yamlLoadIsSafe(deps);
   // provenance for the bare `load(` form: only consider it if js-yaml (or a
   // serialize lib) is imported, else `load(` is too generic.
   const yamlImported =
@@ -1247,6 +1265,9 @@ function ruleUnsafeDeserialize(orig, masked, file, findings) {
       )
     )
       continue;
+    // Declared js-yaml >= 4: `load` is the safe one. Only the yaml forms are
+    // cleared; `unserialize`/`deserialize` are unaffected by that version.
+    if (yamlSafe && !isUnser) continue;
     const at = lineColAt(code, m.index);
     const sevText = isUnser
       ? "Functions/`node-serialize`-style unserialize can construct and immediately invoke attacker-defined functions — direct remote code execution."
@@ -1294,7 +1315,7 @@ function splitTopLevel(s) {
  * @param {string} relPath - path label used in findings
  * @returns {Finding[]}
  */
-export function analyzeSource(src, relPath, cfg, stats) {
+export function analyzeSource(src, relPath, cfg, stats, deps) {
   const findings = [];
   if (typeof src !== "string" || src === "") return findings;
   const masked = maskNonCode(src);
@@ -1306,7 +1327,7 @@ export function analyzeSource(src, relPath, cfg, stats) {
   ruleSsrfFetch(src, masked, relPath, findings);
   ruleHardcodedSecret(src, masked, relPath, findings);
   rulefsPathTraversal(src, masked, relPath, findings, cfg, stats);
-  ruleUnsafeDeserialize(src, masked, relPath, findings);
+  ruleUnsafeDeserialize(src, masked, relPath, findings, deps);
   return findings;
 }
 

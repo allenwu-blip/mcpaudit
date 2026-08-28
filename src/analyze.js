@@ -222,6 +222,17 @@ export function analyzeProject(rootDir, opts = {}) {
   const cfg = loadConfig(rootDir, errors);
   const stats = { suppressedByConfig: 0 };
 
+  // A few rules are version-sensitive: js-yaml 4 made `load` the safe one, so
+  // flagging it in a project that declares ^4 reports a bug the dependency
+  // fixed years ago. Read the root manifest once and hand the ranges down.
+  let deps;
+  try {
+    const pkg = JSON.parse(readFileSync(join(rootDir, "package.json"), "utf8"));
+    deps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+  } catch {
+    deps = undefined; // no manifest, or unreadable: rules fall back to strict
+  }
+
   for (const file of walk(rootDir, errors)) {
     const base = file.split(sep).pop();
     const rel = relative(rootDir, file) || base;
@@ -256,7 +267,7 @@ export function analyzeProject(rootDir, opts = {}) {
       continue;
     }
     scannedFiles.push(rel);
-    for (const f of analyzeSource(txt, rel, cfg, stats)) findings.push(f);
+    for (const f of analyzeSource(txt, rel, cfg, stats, deps)) findings.push(f);
   }
 
   // Config-driven suppression is a human assertion, not an analysis result, so
