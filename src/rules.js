@@ -943,6 +943,40 @@ function ruleHardcodedSecret(orig, masked, file, findings) {
 const FS_PATH_SINKS =
   /\bfs(?:\s*\.\s*promises)?\s*\.\s*(readFile|readFileSync|writeFile|writeFileSync|appendFile|appendFileSync|unlink|unlinkSync|rm|rmSync|readdir|readdirSync|createReadStream|createWriteStream|open|openSync|copyFile|copyFileSync)\s*\(|\b(readFile|writeFile|appendFile|unlink|rm|readdir|copyFile)\s*\(/g;
 
+const PATH_HELPERS = ["join", "resolve", "normalize", "basename"];
+
+/**
+ * Containment idioms are written two ways, and only recognising one of them
+ * was a false-positive source: `path.join(dir, name)` and, just as commonly,
+ * `import { join } from "node:path"` followed by a bare `join(dir, name)`.
+ *
+ * The bare form is only honoured when the file actually destructures that
+ * name out of node:path — same provenance discipline MCP001 uses for
+ * child_process, so a random `resolve()` from a promise helper is not
+ * mistaken for path containment.
+ *
+ * @param {string} orig unmasked source (imports live here)
+ * @returns {RegExp} matches a containment call in an expression
+ */
+function pathContainmentRe(orig) {
+  const names = new Set();
+  const importRe =
+    /(?:import\s*\{([^}]*)\}\s*from\s*['"](?:node:)?path['"]|(?:const|let|var)\s*\{([^}]*)\}\s*=\s*require\(\s*['"](?:node:)?path['"]\s*\))/g;
+  let m;
+  while ((m = importRe.exec(orig))) {
+    for (const raw of (m[1] || m[2] || "").split(",")) {
+      // handles `join`, `join as pathJoin`, `join: pathJoin`
+      const local = raw.split(/\s+as\s+|:/).pop().trim();
+      const orig_ = raw.split(/\s+as\s+|:/)[0].trim();
+      if (PATH_HELPERS.includes(orig_) && /^[\w$]+$/.test(local)) names.add(local);
+    }
+  }
+  const qualified = `\\bpath\\s*\\.\\s*(?:${PATH_HELPERS.join("|")})\\s*\\(`;
+  if (!names.size) return new RegExp(qualified);
+  const bare = `(?<![.\\w$])(?:${[...names].join("|")})\\s*\\(`;
+  return new RegExp(`${qualified}|${bare}`);
+}
+
 // A project-local path validator, by naming convention: `validatePath`,
 // `ensureInsideRoot`, `sanitizePath`, `assertSafePath`, `checkPath`, … We
 // cannot verify what these enforce (no taint tracking), so a hit here
@@ -958,6 +992,7 @@ function rulefsPathTraversal(orig, masked, file, findings) {
     /\bfrom\s+['"]node:fs['"]|\brequire\(\s*['"]node:fs['"]|\bfrom\s+['"]fs['"]|\brequire\(\s*['"]fs['"]|\bimport\s+fs\b|\bfs\s*\.\s*promises\b/.test(
       orig,
     );
+  const containmentRe = pathContainmentRe(orig);
   let m;
   FS_PATH_SINKS.lastIndex = 0;
   while ((m = FS_PATH_SINKS.exec(code))) {
@@ -973,7 +1008,7 @@ function rulefsPathTraversal(orig, masked, file, findings) {
     if (p === "") continue; // pure literal path
     // Any path-module containment idiom anywhere in the path expression →
     // treat as handled (low-FP stance; see header).
-    if (/\bpath\s*\.\s*(join|resolve|normalize|basename)\s*\(/.test(p)) continue;
+    if (containmentRe.test(p)) continue;
     // Now: fire only if p is a bare ident/member, OR a concat/template with a
     // dynamic part. A masked pure-literal is already `""` (skipped above).
     const isConcat = /\+/.test(p) || /\$\{/.test(p) || /^`/.test(p);
@@ -1000,10 +1035,7 @@ function rulefsPathTraversal(orig, masked, file, findings) {
       let a;
       let lastRhs = null;
       while ((a = assignRe.exec(before))) lastRhs = a[1]; // nearest wins
-      if (
-        lastRhs &&
-        /\bpath\s*\.\s*(?:join|resolve|normalize|basename)\s*\(/.test(lastRhs)
-      ) {
+      if (lastRhs && containmentRe.test(lastRhs)) {
         continue; // hoisted containment — handled, do not fire
       }
       // SOFT containment: the value came out of a project-local validator
