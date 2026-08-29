@@ -1,5 +1,5 @@
 /**
- * rules-deep.test.js — TDD coverage for the deeper rule set MCP007–MCP014.
+ * rules-deep.test.js -- TDD coverage for the deeper rule set MCP007-MCP014.
  *
  * Every rule gets the three-way contract the project holds itself to:
  *   - a VULNERABLE case fires with the correct severity + location,
@@ -13,7 +13,7 @@ import { analyzeSource, analyzeManifest } from "../src/rules.js";
 const byRule = (fs, id) => fs.filter((f) => f.ruleId === id);
 const sev = (fs, id) => byRule(fs, id)[0]?.severity;
 
-describe("MCP005 dangerous-eval — member-call false-positive guard", () => {
+describe("MCP005 dangerous-eval -- member-call false-positive guard", () => {
   // Regression for the adversarial-review FP: `/\beval\s*\(/` etc. had NO
   // qualifier guard (unlike MCP001/MCP010 provenance). A `.eval(`/`.compile(`
   // METHOD on some object (math lib, parser, ORM) is legitimate code and must
@@ -59,7 +59,7 @@ describe("MCP005 dangerous-eval — member-call false-positive guard", () => {
   });
 
   it("STILL fires on vm.compileFunction(src) (genuine vm builtin)", () => {
-    // `vm` is a recognised Node builtin namespace — the qualifier guard must
+    // `vm` is a recognised Node builtin namespace -- the qualifier guard must
     // NOT suppress real vm code execution just because it has a `.` before it.
     const code =
       "import vm from 'node:vm';\nvm.compileFunction(attackerSrc);";
@@ -241,7 +241,7 @@ describe("MCP007 prototype pollution", () => {
 
   it("downgrades to LOW behind a same-file validator that rejects proto keys", () => {
     // The validator sits outside the 25-line lookback, as it does in the real
-    // freee-mcp file — so the direct `RESERVED_KEYS.has(...)` branch cannot
+    // freee-mcp file -- so the direct `RESERVED_KEYS.has(...)` branch cannot
     // see it and the finding rests entirely on reading the validator's body.
     const code = [
       "const RESERVED_KEYS = new Set(['__proto__', 'constructor', 'prototype']);",
@@ -660,7 +660,7 @@ describe("MCP014 risky declared dependency (static, no registry)", () => {
       "package.json",
     );
     // An old lodash is a known-CVE version, but we deliberately do NOT
-    // assert that (no offline vuln DB) — so MCP014 must stay silent here.
+    // assert that (no offline vuln DB) -- so MCP014 must stay silent here.
     expect(byRule(all, "MCP014")).toHaveLength(0);
   });
 });
@@ -674,5 +674,64 @@ describe("manifest rules are shape-aware (no cross-manifest double-fire)", () =>
     );
     expect(byRule(f, "MCP012")).toHaveLength(0);
     expect(byRule(f, "MCP014")).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// MCP009 -- a key the code itself says is public.
+// Found scanning ChromeDevTools/chrome-devtools-mcp, which bluesky-social and
+// others install. The key below is a SYNTHETIC 39-char value with the right
+// shape; never put a real credential in a test fixture.
+// ---------------------------------------------------------------------------
+const FAKE_GOOGLE_KEY = "AIzaSyA1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q";
+
+describe("MCP009 hardcoded secret", () => {
+  it("downgrades when a comment directly above declares the key public", () => {
+    const code = [
+      "async function crux() {",
+      "  // go/jtfbx. Yes, we're aware this API key is public. ;)",
+      "  setEndpoint(",
+      `    'https://chromeuxreport.googleapis.com/v1/records?key=${FAKE_GOOGLE_KEY}',`,
+      "  );",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "crux.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("low");
+    expect(f[0].message).toMatch(/restricted by referrer/);
+  });
+
+  it("STILL reports CRITICAL without such a comment", () => {
+    const code = [
+      "async function crux() {",
+      "  // fetch field data",
+      "  setEndpoint(",
+      `    'https://chromeuxreport.googleapis.com/v1/records?key=${FAKE_GOOGLE_KEY}',`,
+      "  );",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "crux2.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("critical");
+  });
+
+  it("NEVER downgrades a PRIVATE KEY, whatever the comment claims", () => {
+    const code = [
+      "// this key is public, honest",
+      "const k = `-----BEGIN RSA PRIVATE KEY-----`;",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "pk.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("critical");
+  });
+
+  it("does not treat an unrelated nearby comment as an assertion", () => {
+    const code = [
+      "// the public API is documented at example.com",
+      `const k = '${FAKE_GOOGLE_KEY}';`,
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "unrel.ts"), "MCP009");
+    expect(f.length).toBeGreaterThanOrEqual(1);
+    expect(f[0].severity).toBe("critical");
   });
 });

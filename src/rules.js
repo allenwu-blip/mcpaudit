@@ -1291,6 +1291,22 @@ const SECRET_PATTERNS = [
 const SECRET_PLACEHOLDER =
   /\b(x{4,}|your[-_]|example|changeme|placeholder|dummy|redacted|sample|test[-_]?key|fake|<[^>]+>|\.\.\.|insert[-_]|todo)\b/i;
 
+// Some keys are SUPPOSED to ship. Browser-delivered Google/Firebase/Stripe
+// publishable keys are restricted by referrer and quota, and the API cannot
+// work without them being in the client. ChromeDevTools/chrome-devtools-mcp
+// says so on the line above the key:
+//
+//     // go/jtfbx. Yes, we're aware this API key is public. ;)
+//     'https://chromeuxreport.googleapis.com/v1/records:queryRecord?key=AIza...'
+//
+// Reporting that as a critical secret leak tells a team that the thing they
+// already investigated and documented is an emergency. An in-repo comment is a
+// human assertion about the code, which is exactly the trust model every linter
+// already uses for `// eslint-disable`, so honour it -- but downgrade rather
+// than suppress, and only for a deliberate, specific phrasing.
+const PUBLIC_KEY_ASSERTION =
+  /\b(?:key|token|this)\b[^\n]{0,40}\b(?:is\s+(?:intentionally\s+|deliberately\s+)?public|public\s+(?:on\s+purpose|by\s+design)|not\s+(?:a\s+)?secret|safe\s+to\s+(?:expose|publish|commit))/i;
+
 function ruleHardcodedSecret(orig, masked, file, findings) {
   // Secrets live in *string literals*. `masked.strings` records each literal
   // (raw text, start line) and excludes comments — so a key only mentioned in
@@ -1307,14 +1323,23 @@ function ruleHardcodedSecret(orig, masked, file, findings) {
       const key = `${s.line}|${tok.slice(0, 12)}`;
       if (seen.has(key)) continue;
       seen.add(key);
+      // Look at the two lines above the literal in the ORIGINAL source: masked
+      // code blanks comments, which is where the assertion lives.
+      const above = orig.split("\n").slice(Math.max(0, s.line - 3), s.line).join("\n");
+      const declaredPublic =
+        /\/\/|\/\*|\*|#/.test(above) && PUBLIC_KEY_ASSERTION.test(above);
+      const isPrivateKey = /PRIVATE KEY/.test(tok);
       findings.push(
         mkFinding(
           "MCP009",
-          "critical",
+          declaredPublic && !isPrivateKey ? "low" : "critical",
           file,
           s.line,
           1,
-          `A string literal contains what looks like ${what}. A real credential committed into an MCP server's source (and especially into a tool description/schema the model can read back) is an immediate secret leak and is in your git history forever.`,
+          `A string literal contains what looks like ${what}. A real credential committed into an MCP server's source (and especially into a tool description/schema the model can read back) is an immediate secret leak and is in your git history forever.` +
+            (declaredPublic && !isPrivateKey
+              ? " Reported at LOW: a comment directly above states this key is public. Client-delivered keys (Google/Firebase browser keys, Stripe publishable keys) are meant to ship. Confirm it is restricted by referrer/quota and carries no server-side scope."
+              : ""),
           "Remove the secret, rotate it immediately (assume it is compromised once committed), and load it from an environment variable / secret manager at runtime. Never place credentials in tool descriptions or schemas.",
           orig,
         ),
