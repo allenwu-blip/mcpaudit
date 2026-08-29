@@ -71,6 +71,49 @@ describe("MCP001 command-injection (source)", () => {
       'import * as cp from "node:child_process";\ncp.execSync(`rm ${p}`);';
     expect(byRule(analyzeSource(code, "ns.js"), "MCP001")).toHaveLength(1);
   });
+
+  // A `const` bound to a string literal IS a literal. Found scanning
+  // ooples/token-optimizer-mcp, where `const command = 'ping'` two lines above
+  // the call was reported as an attacker-chosen binary.
+
+  it("does NOT fire when the program is a const bound to a string literal", () => {
+    const code = [
+      "import { spawn } from 'child_process';",
+      "const command = 'ping';",
+      "const child = spawn(command, args, { shell: false });",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "lit.ts"), "MCP001")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a platform ternary between two literals", () => {
+    const code = [
+      "import { spawn } from 'child_process';",
+      "const command = isWindows ? 'tasklist' : 'ps';",
+      "spawn(command, args, { shell: false });",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "tern.ts"), "MCP001")).toHaveLength(0);
+  });
+
+  it("STILL fires when the binding is `let` and reassigned", () => {
+    const code = [
+      "import { spawn } from 'child_process';",
+      "let command = 'ping';",
+      "command = input.cmd;",
+      "spawn(command, args, { shell: false });",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "let.ts"), "MCP001")).toHaveLength(1);
+  });
+
+  it("STILL fires when the const holds an interpolated template", () => {
+    const code = [
+      "import { execSync } from 'child_process';",
+      "const command = `bash \"${installScript}\"`;",
+      "execSync(command, { stdio: 'inherit' });",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "interp.ts"), "MCP001");
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("critical");
+  });
 });
 
 describe("MCP002 env-exfiltration (source)", () => {

@@ -322,8 +322,38 @@ function ruleCommandInjection(orig, masked, file, findings) {
     const openIdx = code.indexOf("(", site.at);
     if (openIdx < 0) continue;
     const { firstArg, fullArgs } = scanCallArgs(code, openIdx);
-    const firstKind = argIsNonLiteral(firstArg);
+    let firstKind = argIsNonLiteral(firstArg);
     const shellTrue = /shell\s*:\s*true/.test(fullArgs);
+
+    // A `const` bound to a string literal IS a literal. Naming the program
+    // before running it is ordinary style, and a platform switch between two
+    // literals is the normal way to write a cross-platform call:
+    //     const command = 'ping';
+    //     const command = isWindows ? 'tasklist' : 'ps';
+    //     spawn(command, args, { shell: false })
+    // Treating the identifier as dynamic reported `ping` as an attacker-chosen
+    // binary. `const` cannot be rebound, so resolving one hop is sound.
+    if (firstKind === true) {
+      const nm = /^[A-Za-z_$][\w$]*$/.exec(firstArg.trim())?.[0];
+      if (nm) {
+        const bind = new RegExp(
+          `(?:^|[\\n;{}])\\s*const\\s+${nm}\\s*=\\s*([^;\\n]+)`,
+        ).exec(orig);
+        const rhs = bind?.[1]?.trim();
+        // `${` disqualifies a template literal: that is interpolation, which is
+        // the very thing this rule exists to catch.
+        const PURE_LITERAL = /^(['"`])[^'"`\n]*\1$/;
+        const TERNARY_OF_LITERALS =
+          /\?\s*(['"`])[^'"`\n]*\1\s*:\s*(['"`])[^'"`\n]*\2$/;
+        if (
+          rhs &&
+          !rhs.includes("${") &&
+          (PURE_LITERAL.test(rhs) || TERNARY_OF_LITERALS.test(rhs))
+        ) {
+          firstKind = false;
+        }
+      }
+    }
 
     // ARGV FORM vs SHELL FORM.
     // `execFile`, and also `spawn`/`spawnSync`/`fork` when `shell: true` is
