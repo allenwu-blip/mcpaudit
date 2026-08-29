@@ -8,7 +8,7 @@ reads that code *before* you trust it and points out the dangerous bits — the
 quick safety check that doesn't really exist for these plugins yet.
 
 ```bash
-npx allenwu-blip/mcpaudit ./path-to-an-mcp-server
+npx allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac ./path-to-an-mcp-server
 ```
 
 No install, no setup, no API key, no internet needed. It reads the plugin's
@@ -79,24 +79,36 @@ LLM-visible context, and over-broad filesystem/tool scope.
 It's zero-install via `npx`. A local path is scanned fully offline:
 
 ```bash
+# Pin to a commit. Read it first if you like — that is the point of a pin.
+MCPAUDIT='allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac'
+
 # scan a server you cloned / vendored
-npx allenwu-blip/mcpaudit ./vendor/some-mcp-server
+npx "$MCPAUDIT" ./vendor/some-mcp-server
 
 # machine-readable output for CI / tooling
-npx allenwu-blip/mcpaudit ./server --json
+npx "$MCPAUDIT" ./server --json
 
 # SARIF v2.1.0 (a standard scan-results format GitHub understands) —
 # upload it so findings show in GitHub's Code scanning tab
-npx allenwu-blip/mcpaudit ./server --sarif > mcpaudit.sarif
+npx "$MCPAUDIT" ./server --sarif > mcpaudit.sarif
 
 # stricter gate: any high or critical fails the command
-npx allenwu-blip/mcpaudit ./server --fail-on high
+npx "$MCPAUDIT" ./server --fail-on high
 
 # continuous monitoring: accept current state, then gate only on NEW
 # regressions (offline, no accounts) — see "Continuous monitoring" below
-npx allenwu-blip/mcpaudit ./server --baseline-write .mcpaudit-baseline.json
-npx allenwu-blip/mcpaudit ./server --baseline .mcpaudit-baseline.json
+npx "$MCPAUDIT" ./server --baseline-write .mcpaudit-baseline.json
+npx "$MCPAUDIT" ./server --baseline .mcpaudit-baseline.json
 ```
+
+> **Why the commit hash.** `npx allenwu-blip/mcpaudit` — no hash — runs
+> whatever is on `main` at the moment you type it, which is a stranger's
+> code that can change between your two runs. A security tool asking you to
+> do that is a tool that has not read its own MCP006 rule. The pin above is
+> the commit these docs were written against; `git log` it, diff it, or
+> replace it with a later one you have looked at. This suggestion came from
+> [@ooples](https://github.com/ooples), who declined to run the unpinned
+> form and audited by hand instead. He was right.
 
 > Scanning by **bare package name** (`npx mcpaudit some-mcp-pkg`) needs a
 > registry/tarball fetch wired up; the published build asks you to pass a
@@ -209,13 +221,13 @@ committed baseline — pure, deterministic, offline, no sign-up:
 
 ```bash
 # 1. accept the current state into a baseline and commit it
-npx allenwu-blip/mcpaudit ./server --baseline-write .mcpaudit-baseline.json
+npx allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac ./server --baseline-write .mcpaudit-baseline.json
 git add .mcpaudit-baseline.json && git commit -m "mcpaudit baseline"
 
 # 2. in CI: re-scan and gate ONLY on NEW findings (regressions). An
 #    already-triaged finding no longer re-breaks every build; a freshly
 #    introduced one does.
-npx allenwu-blip/mcpaudit ./server --baseline .mcpaudit-baseline.json --fail-on high
+npx allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac ./server --baseline .mcpaudit-baseline.json --fail-on high
 ```
 
 The baseline file is intentionally **timestamp/host/user-free** so re-writing
