@@ -271,6 +271,34 @@ describe("MCP007 prototype pollution", () => {
     expect(f[0].severity).not.toBe("low");
   });
 
+  // -- a string-literal union type is a closed set, found in mongodb-mcp-server
+
+  it("does NOT fire when the key's TS type is a union of string literals", () => {
+    const code = [
+      "class ToolBase {",
+      "  release() { const ctor = this.constructor; return ctor; }",
+      '  private redirect(property: "argsShape" | "outputSchema", shape: Shape): void {',
+      "    this[property] = shape;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "union.ts"), "MCP007")).toHaveLength(0);
+  });
+
+  it("STILL fires when a literal union actually contains a proto key", () => {
+    const code = [
+      "class Evil {",
+      "  release() { const ctor = this.constructor; return ctor; }",
+      '  set(property: "argsShape" | "__proto__", shape: Shape): void {',
+      "    this[property] = shape;",
+      "  }",
+      "}",
+    ].join("\n");
+    expect(
+      byRule(analyzeSource(code, "evil.ts"), "MCP007").length,
+    ).toBeGreaterThanOrEqual(1);
+  });
+
   it("does NOT fire on Map.set reached through a `!` non-null assertion", () => {
     const code = [
       "class P {",

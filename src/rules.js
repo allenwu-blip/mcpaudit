@@ -831,6 +831,34 @@ function ruleProtoPollution(orig, masked, file, findings) {
     //              see where the key came from, so this is a medium, not a
     //              high — claiming high on "the file says prototype somewhere"
     //              is the overreach that produced 57 findings in one repo.
+    // A key declared with a TypeScript union of string literals is a CLOSED
+    // SET, and the members are right there to read:
+    //     private redirectToSharedShape(
+    //       property: "argsShape" | "outputSchema", shape: ZodRawShape) {
+    //       this[property] = shape;
+    // Unlike an allowlist held in a named Set, nothing here is hidden from a
+    // lexical reader — so this is a suppression, not a downgrade. Read from
+    // the raw lines because masking blanks the literals.
+    const keyIdent = /^[\w$]+$/.test((keyExpr || "").trim())
+      ? keyExpr.trim()
+      : null;
+    if (keyIdent) {
+      const sigWin = rawLines.slice(Math.max(0, li - 30), li).join("\n");
+      const union = new RegExp(
+        `\\b${keyIdent}\\s*\\??\\s*:\\s*((?:["'][^"'\\n]*["']\\s*(?:\\|\\s*)?)+)`,
+      ).exec(sigWin);
+      if (union) {
+        const members = union[1].match(/["']([^"'\n]*)["']/g) || [];
+        const names = members.map((s) => s.slice(1, -1));
+        if (
+          names.length &&
+          !names.some((n) => /^(?:__proto__|constructor|prototype)$/.test(n))
+        ) {
+          continue;
+        }
+      }
+    }
+
     const external =
       !keyIsLiteral && !keyIsNumber && keyIsExternal(keyExpr, lines, li);
     const protoEvidence =
