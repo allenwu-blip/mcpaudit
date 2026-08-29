@@ -56,6 +56,32 @@ Write-ups: [scanning 12 MCP servers](https://gist.github.com/allenwu-blip/d20a11
 
 ---
 
+## Hiring me to do this to your code
+
+The scanner is free and always will be. The thing it cannot do is read your
+source and tell you which hits are real — that part is me, by hand, and I do
+it for money.
+
+**What you get:** a scan, a hand-triage of every single finding marked *real*,
+*not real*, or *can't tell from here* with the reasoning shown, and a report
+written so an engineer can act on it without rerunning anything. If a finding
+turns out to be your mitigation rather than your bug, I say so — that mistake
+is the one I have made most often and the one I now check hardest for.
+
+**What you don't get, stated up front:** JavaScript and TypeScript only, not
+Go, Rust, C#, Python or Solidity. Lexical static analysis with no taint
+tracking and no cross-file data flow. My deliverable says *"no exploitable
+issues found in the code as written"* — never *"this code is secure."*
+
+**First one is free.** Pick a repository, I scan and triage it, and send back
+the findings. If it isn't up to your standard you keep the report and we stop
+there — you have lost nothing and I have lost an afternoon.
+
+To start: [open an issue](https://github.com/allenwu-blip/mcpaudit/issues/new)
+with the repo, or message [@allenwu-blip](https://github.com/allenwu-blip).
+
+---
+
 ## Why
 
 These plugins run with real power *inside* the AI agent's loop — they can get a
