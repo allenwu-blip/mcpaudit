@@ -8,7 +8,7 @@ reads that code *before* you trust it and points out the dangerous bits — the
 quick safety check that doesn't really exist for these plugins yet.
 
 ```bash
-npx allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac ./path-to-an-mcp-server
+npx allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9 ./path-to-an-mcp-server
 ```
 
 No install, no setup, no API key, no internet needed. It reads the plugin's
@@ -80,7 +80,7 @@ It's zero-install via `npx`. A local path is scanned fully offline:
 
 ```bash
 # Pin to a commit. Read it first if you like — that is the point of a pin.
-MCPAUDIT='allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac'
+MCPAUDIT='allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9'
 
 # scan a server you cloned / vendored
 npx "$MCPAUDIT" ./vendor/some-mcp-server
@@ -221,13 +221,13 @@ committed baseline — pure, deterministic, offline, no sign-up:
 
 ```bash
 # 1. accept the current state into a baseline and commit it
-npx allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac ./server --baseline-write .mcpaudit-baseline.json
+npx allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9 ./server --baseline-write .mcpaudit-baseline.json
 git add .mcpaudit-baseline.json && git commit -m "mcpaudit baseline"
 
 # 2. in CI: re-scan and gate ONLY on NEW findings (regressions). An
 #    already-triaged finding no longer re-breaks every build; a freshly
 #    introduced one does.
-npx allenwu-blip/mcpaudit#9444cac36d7ee51e8c5bb9e148c72b2dfbad1eac ./server --baseline .mcpaudit-baseline.json --fail-on high
+npx allenwu-blip/mcpaudit#0040ed63d9bae5b0fbe0323928178455253034e9 ./server --baseline .mcpaudit-baseline.json --fail-on high
 ```
 
 The baseline file is intentionally **timestamp/host/user-free** so re-writing
