@@ -162,9 +162,17 @@ describe("generated/vendored duplicate accounting", () => {
     expect(r.duplicateGroups[0].perCopy).toBe(1);
     // 4 copies + 1 unique file = 5 findings, 2 distinct.
     expect(r.findings).toHaveLength(5);
-    const note = r.errors.find((e) => /byte-identical/.test(e));
+    const note = r.errors.find((e) => /leading comment banner/.test(e));
     expect(note).toBeTruthy();
     expect(note).toMatch(/gives 2 distinct/);
+  });
+
+  it("does not name a source when every file in the group is identical", () => {
+    // Nothing here carries a banner, so there is no odd one out. Guessing
+    // which of four identical files is "the original" would be a coin flip.
+    const r = analyzeProject(dir);
+    expect(r.duplicateGroups[0].source).toBeNull();
+    expect(r.errors.find((e) => /Edit the un-stamped original/.test(e))).toBeUndefined();
   });
 
   it("still REPORTS every copy — dedup is accounting, not suppression", () => {
@@ -184,7 +192,109 @@ describe("generated/vendored duplicate accounting", () => {
     }
     const r = analyzeProject(clean);
     expect(r.duplicateGroups).toHaveLength(0);
-    expect(r.errors.some((e) => /byte-identical/.test(e))).toBe(false);
+    expect(r.errors.some((e) => /leading comment banner/.test(e))).toBe(false);
     rmSync(clean, { recursive: true, force: true });
+  });
+});
+
+// Reported by @ooples on ooples/token-optimizer-mcp#343: every generated copy
+// there carries a two-line "GENERATED FILE -- do not edit" banner, so a
+// raw-bytes grouper leaves the source of truth outside the group it is the
+// source of — "the file your report tells a maintainer to edit is the one file
+// your grouper won't group."
+describe("generated copies carrying a banner", () => {
+  let dir;
+  const VULN = 'import { execSync } from "child_process";\nexport const r = (c) => execSync(`ls ${c}`);\n';
+  const BANNER =
+    "// GENERATED FILE -- do not edit.\n" +
+    "// Source of truth: hooks-core/lib.js. Regenerate with `npm run sync:hooks`.\n";
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcpaudit-banner-"));
+    const mk = (rel, body) => {
+      const full = join(dir, rel);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, body, "utf8");
+    };
+    mk("package.json", JSON.stringify({ name: "b", version: "1.0.0" }));
+    mk("hooks-core/lib.js", VULN);
+    for (const agent of ["cursor", "codex", "gemini"])
+      mk(`integrations/${agent}/hooks/lib.js`, BANNER + VULN);
+  });
+
+  it("groups the un-stamped source together with its stamped copies", () => {
+    const r = analyzeProject(dir);
+    expect(r.duplicateGroups).toHaveLength(1);
+    expect(r.duplicateGroups[0].copies).toBe(4);
+  });
+
+  it("names the source as the file to edit", () => {
+    const r = analyzeProject(dir);
+    expect(r.duplicateGroups[0].source.replace(/\\/g, "/")).toBe("hooks-core/lib.js");
+    const note = r.errors.find((e) => /Edit the un-stamped original/.test(e));
+    expect(note).toBeTruthy();
+    expect(note).toMatch(/hooks-core[\\/]lib\.js/);
+  });
+
+  it("still reports the finding in every copy", () => {
+    const r = analyzeProject(dir);
+    const files = r.findings.map((f) => f.file.replace(/\\/g, "/"));
+    expect(files).toContain("hooks-core/lib.js");
+    expect(files).toContain("integrations/cursor/hooks/lib.js");
+    expect(files).toContain("integrations/codex/hooks/lib.js");
+    expect(files).toContain("integrations/gemini/hooks/lib.js");
+  });
+
+  it("does not group two modules that merely share a banner", () => {
+    // The banner is stripped for comparison, not ignored wholesale — files
+    // with different bodies must stay apart however similar their headers.
+    const two = mkdtempSync(join(tmpdir(), "mcpaudit-banner2-"));
+    mkdirSync(join(two, "a"), { recursive: true });
+    mkdirSync(join(two, "b"), { recursive: true });
+    writeFileSync(join(two, "package.json"), JSON.stringify({ name: "t", version: "1.0.0" }), "utf8");
+    writeFileSync(join(two, "a/x.js"), BANNER + VULN, "utf8");
+    writeFileSync(join(two, "b/x.js"), BANNER + VULN.replace("ls", "cat"), "utf8");
+    const r = analyzeProject(two);
+    expect(r.duplicateGroups).toHaveLength(0);
+    rmSync(two, { recursive: true, force: true });
+  });
+});
+
+describe("dot-directories are scanned unless named", () => {
+  // `.github/` held one of eleven generated copies in token-optimizer-mcp, and
+  // `.cursor/mcp.json` / `.vscode/mcp.json` are manifests MCP003/4/6 exist to
+  // read. A blanket dot-prefix skip made all of them invisible.
+  let dir;
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcpaudit-dotdirs-"));
+    const mk = (rel, body) => {
+      const full = join(dir, rel);
+      mkdirSync(dirname(full), { recursive: true });
+      writeFileSync(full, body, "utf8");
+    };
+    mk("package.json", JSON.stringify({ name: "d", version: "1.0.0" }));
+    mk(
+      ".github/hooks/lib.js",
+      'import { execSync } from "child_process";\nexport const r = (c) => execSync(`ls ${c}`);\n',
+    );
+    mk(".git/objects/evil.js", 'import { execSync } from "child_process";\nexport const r = (c) => execSync(`ls ${c}`);\n');
+    mk(".venv/lib/pkg.js", 'import { execSync } from "child_process";\nexport const r = (c) => execSync(`ls ${c}`);\n');
+  });
+
+  it("scans .github", () => {
+    const r = analyzeProject(dir);
+    const files = r.findings.map((f) => f.file.replace(/\\/g, "/"));
+    expect(files).toContain(".github/hooks/lib.js");
+  });
+
+  it("still skips VCS metadata and virtualenvs", () => {
+    const r = analyzeProject(dir);
+    const files = r.findings.map((f) => f.file.replace(/\\/g, "/"));
+    expect(files.some((f) => f.startsWith(".git/"))).toBe(false);
+    expect(files.some((f) => f.startsWith(".venv/"))).toBe(false);
   });
 });
