@@ -18,6 +18,44 @@ it only reads it.
 
 ---
 
+## Track record
+
+This has been run against real servers, and every finding was read by hand
+before it was reported to anyone.
+
+- **12 MCP servers audited** — the four official TypeScript reference
+  implementations plus eight third-party ones. Public reports filed on MongoDB,
+  Softeria, mobile-mcp, mcpvault, mcp-server-neon, freee, ssh-mcp and
+  token-optimizer.
+- **A maintainer independently checked the triage.** From
+  [ms-365-mcp-server#651](https://github.com/Softeria/ms-365-mcp-server/issues/651),
+  which they then closed as completed: *"I spot-checked the `src/` ones and your
+  triage matches what I see."*
+- **MongoDB routed the report into internal tracking** —
+  [issue #1470](https://github.com/mongodb-js/mongodb-mcp-server/issues/1470),
+  Jira MCP-637.
+- **A user found a false negative and it got fixed.** That same maintainer
+  pointed out a `spawn` this scanner had missed, because they inject it as a
+  class field so the call site reads `spawnCommand` rather than an imported
+  name. Aliases are now resolved; seven regression tests cover it.
+
+Triaging that corpus turned up **22 precision bugs in this tool**, which is the
+more useful number. Findings across the twelve repositories went 652 → 436 and
+criticals 105 → 9 — that is the raw hit count moving, not a false-positive rate.
+
+Four of the 22 were the same mistake: a *defence* reported as the vulnerability
+— an allowlist guard, a reserved-key set containing `__proto__`, a file named
+`safe-exec.ts` documenting the CWE-78 mitigation it enforces, and a Google API
+key one line under a comment saying it is public. Defensive code and vulnerable
+code look alike at the token level; the difference is the direction of the
+logic. A scanner that cannot tell them apart punishes the teams that did the
+work. Avoiding that is most of what the rules above are for.
+
+Write-ups: [scanning 12 MCP servers](https://gist.github.com/allenwu-blip/d20a110207dd36cd3b4d86f3960ec215)
+· [what 396 repos actually install](https://gist.github.com/allenwu-blip/817f4a181ec9ef050b6a25e992cdad4e)
+
+---
+
 ## Why
 
 These plugins run with real power *inside* the AI agent's loop — they can get a
