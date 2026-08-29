@@ -285,7 +285,50 @@ function childProcessBindings(code) {
       }
     }
   }
-  return { cpNamespaces, cpFns };
+  // ALIASES. An imported exec function that is re-bound and called through the
+  // new name is invisible to a call-site match on the imported name. Dependency
+  // injection for testability does exactly this, and it is common:
+  //     import { spawn } from 'node:child_process';
+  //     private readonly spawnCommand: SpawnCommand = spawn;
+  //     child = spawnCommand(commandPath, args, { stdio: 'pipe', shell: false });
+  // Reported to me by the ms-365-mcp-server maintainer as the one real exec path
+  // in their runtime, which my scan had missed entirely. A false negative in a
+  // security tool is worse than any amount of noise, so aliases are resolved.
+  //
+  // Only bindings whose right-hand side is EXACTLY a known exec function (or
+  // `ns.execFn`) count. `const run = () => spawn(...)` is a wrapper, not an
+  // alias — the call inside it is already matched on its own.
+  // alias name -> the canonical child_process function it stands for, so the
+  // argv-form vs shell-form decision downstream still asks the right question.
+  const cpAliases = new Map();
+  const EXECISH = new Set(EXEC_FNS.concat(["execFile", "execFileSync"]));
+  const canonical = (rhs) => {
+    const dot = rhs.indexOf(".");
+    if (dot < 0)
+      return cpFns.has(rhs) && EXECISH.has(rhs)
+        ? rhs
+        : (cpAliases.get(rhs) ?? null);
+    return cpNamespaces.has(rhs.slice(0, dot)) && EXECISH.has(rhs.slice(dot + 1))
+      ? rhs.slice(dot + 1)
+      : null;
+  };
+  const aliasRe =
+    /(?:(?:const|let|var)\s+|(?:private|public|protected|readonly|static)\s+)*([A-Za-z_$][\w$]*)\s*(?::\s*[^=;\n]+?)?=\s*([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)?)\s*[;,\n)]/g;
+  // Two passes so an alias of an alias (`const a = spawn; const b = a;`)
+  // resolves too.
+  for (let pass = 0; pass < 2; pass++) {
+    aliasRe.lastIndex = 0;
+    let al;
+    while ((al = aliasRe.exec(code))) {
+      const lhs = al[1];
+      const rhs = al[2].replace(/\s+/g, "");
+      if (lhs === rhs || cpAliases.has(lhs)) continue;
+      const c = canonical(rhs);
+      if (c) cpAliases.set(lhs, c);
+    }
+  }
+
+  return { cpNamespaces, cpFns, cpAliases };
 }
 
 function ruleCommandInjection(orig, masked, file, findings) {
@@ -294,7 +337,7 @@ function ruleCommandInjection(orig, masked, file, findings) {
   // (e.g. "child_process") is blanked in masked code, so binding detection
   // must read orig. Call SITES are still matched in masked code below, so a
   // commented-out call never fires regardless.
-  const { cpNamespaces, cpFns } = childProcessBindings(orig);
+  const { cpNamespaces, cpFns, cpAliases } = childProcessBindings(orig);
   if (cpNamespaces.size === 0 && cpFns.size === 0) return; // no CP usage
 
   const nsAlt = [...cpNamespaces].map((s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -304,23 +347,37 @@ function ruleCommandInjection(orig, masked, file, findings) {
   const qualified = nsAlt.length
     ? new RegExp(`\\b(?:${nsAlt.join("|")})\\.(${fnList.join("|")})\\s*\\(`, "g")
     : null;
-  const bareNames = fnList.filter((f) => cpFns.has(f));
+  // Aliases join the bare-name list; the matched text is mapped back to the
+  // canonical function so `isArgvForm` below still asks the right question.
+  const bareNames = fnList.filter((f) => cpFns.has(f)).concat([...cpAliases.keys()]);
   const bare = bareNames.length
     ? new RegExp(`(?<![.\\w$])(${bareNames.join("|")})\\s*\\(`, "g")
     : null;
 
+  // `this.spawnCommand(...)` where the field was initialised from `spawn`. Only
+  // `this.` is allowed: the alias name came from a real binding in this file, but
+  // matching any `X.alias(` would start guessing about other objects.
+  const aliasNames = [...cpAliases.keys()];
+  const thisAlias = aliasNames.length
+    ? new RegExp(`\\bthis\\s*\\.\\s*(${aliasNames.join("|")})\\s*\\(`, "g")
+    : null;
+
   const sites = [];
-  for (const re of [qualified, bare]) {
+  for (const re of [qualified, bare, thisAlias]) {
     if (!re) continue;
     let mm;
     while ((mm = re.exec(code))) sites.push({ fn: mm[1], at: mm.index });
   }
   sites.sort((a, b) => a.at - b.at);
+  // A `this.x(` match and a bare `x(` match can overlap on the same call.
+  const seen = new Set();
 
   for (const site of sites) {
-    const fn = site.fn;
+    const fn = cpAliases.get(site.fn) ?? site.fn;
     const openIdx = code.indexOf("(", site.at);
     if (openIdx < 0) continue;
+    if (seen.has(openIdx)) continue;
+    seen.add(openIdx);
     const { firstArg, fullArgs } = scanCallArgs(code, openIdx);
     let firstKind = argIsNonLiteral(firstArg);
     const shellTrue = /shell\s*:\s*true/.test(fullArgs);

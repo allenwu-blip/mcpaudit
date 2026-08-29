@@ -104,6 +104,92 @@ describe("MCP001 command-injection (source)", () => {
     expect(byRule(analyzeSource(code, "let.ts"), "MCP001")).toHaveLength(1);
   });
 
+  // ALIASES. Reported by the ms-365-mcp-server maintainer on the audit issue:
+  // `src/token-cache-storage.ts` spawns a child process and my scan missed it
+  // entirely, because `spawn` is injected as a field and called through the new
+  // name. A false negative is worse than any amount of noise.
+
+  it("fires on a child_process fn injected as a class field", () => {
+    const code = [
+      "import { spawn } from 'node:child_process';",
+      "class Store {",
+      "  constructor(private readonly spawnCommand: SpawnCommand = spawn) {}",
+      "  run(commandPath, args) {",
+      "    return this.spawnCommand(commandPath, args, { stdio: 'pipe', shell: false });",
+      "  }",
+      "}",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "di.ts"), "MCP001");
+    expect(f).toHaveLength(1);
+    expect(f[0].line).toBe(5);
+  });
+
+  it("fires on a bare call through a simple alias", () => {
+    const code = [
+      "import { spawn } from 'node:child_process';",
+      "const spawnCommand = spawn;",
+      "function run(commandPath, args) {",
+      "  return spawnCommand(commandPath, args, { stdio: 'pipe', shell: false });",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "alias.ts"))).toBeDefined();
+    expect(byRule(analyzeSource(code, "alias.ts"), "MCP001")).toHaveLength(1);
+  });
+
+  it("resolves an alias of an alias, keeping the canonical fn's severity", () => {
+    const code = [
+      "import { execSync } from 'node:child_process';",
+      "const a = execSync;",
+      "const b = a;",
+      "function go(p) { b(`ls ${p}`); }",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "chain.ts"), "MCP001");
+    expect(f).toHaveLength(1);
+    // execSync is shell-form, so this must stay critical rather than being
+    // treated as the argv-form `spawn` case.
+    expect(f[0].severity).toBe("critical");
+  });
+
+  it("resolves a namespaced alias (`const r = cp.execSync`)", () => {
+    const code = [
+      "import * as cp from 'node:child_process';",
+      "const runner = cp.execSync;",
+      "function go(p) { runner(`ls ${p}`); }",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "nsalias.ts"), "MCP001")).toHaveLength(1);
+  });
+
+  it("does NOT treat a WRAPPER as an alias", () => {
+    // `run` is a function that calls spawn, not another name for spawn. The
+    // call inside it is already matched on its own merits.
+    const code = [
+      "import { spawn } from 'node:child_process';",
+      "const run = () => spawn('ls', []);",
+      "function go() { run(); }",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "wrap.ts"), "MCP001")).toHaveLength(0);
+  });
+
+  it("does NOT alias an unrelated binding that merely sits near an import", () => {
+    const code = [
+      "import { spawn } from 'node:child_process';",
+      "const format = someOtherThing;",
+      "function go(x) { return format(x); }",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "unrel.ts"), "MCP001")).toHaveLength(0);
+  });
+
+  it("reports an aliased call ONCE, not once per matching pattern", () => {
+    const code = [
+      "import { spawn } from 'node:child_process';",
+      "class S {",
+      "  private readonly spawnCommand = spawn;",
+      "  go(c, a) { return this.spawnCommand(c, a, { shell: false }); }",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "once.ts"), "MCP001")).toHaveLength(1);
+  });
+
   it("STILL fires when the const holds an interpolated template", () => {
     const code = [
       "import { execSync } from 'child_process';",
