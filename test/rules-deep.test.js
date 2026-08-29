@@ -735,3 +735,65 @@ describe("MCP009 hardcoded secret", () => {
     expect(f[0].severity).toBe("critical");
   });
 });
+
+// ---------------------------------------------------------------------------
+// MCP015 -- a module that ships but does nothing, and telling a COLLAPSED file
+// from a MINIFIED one. Both suggested by the ooples/token-optimizer-mcp
+// maintainer after this scanner skipped one of their files as "minified" when
+// it was not: its newlines had been stripped and the body sat behind a `//`.
+// ---------------------------------------------------------------------------
+describe("MCP015 dead module", () => {
+  it("fires on a file whose entire body is behind a line comment", () => {
+    const body = "const x = 1; ".repeat(60);
+    const code = "/** header */\n// " + body;
+    const f = byRule(analyzeSource(code, "collapsed.ts"), "MCP015");
+    expect(f).toHaveLength(1);
+    expect(f[0].severity).toBe("low");
+    expect(f[0].message).toMatch(/no executable code/);
+  });
+
+  it("fires on a barrel file emptied to comments, with no long line at all", () => {
+    // 257 bytes, 10 short lines, zero exports -- the real
+    // src/tools/dashboard-monitoring/index.ts. A bytes-per-line heuristic
+    // cannot see this one; masking-to-empty can.
+    const code = [
+      "/**",
+      " * Dashboard & Monitoring Tools - Track 2E",
+      " *",
+      " * Export all dashboard and monitoring tools",
+      " */",
+      "",
+      "// SmartDashboard - Implementation pending",
+      "// MetricCollector - Implementation pending",
+      "// Note: Exports temporarily removed until implementation is complete",
+      "// padding to clear the 200-byte floor ..........................",
+    ].join("\n");
+    const f = byRule(analyzeSource(code, "barrel.ts"), "MCP015");
+    expect(f).toHaveLength(1);
+    // No 5000-char line, so the message must NOT claim newlines were stripped.
+    expect(f[0].message).not.toMatch(/newlines were stripped/);
+  });
+
+  it("does NOT fire on a file with real code and heavy comments", () => {
+    const code = [
+      "/** A big explanatory header that goes on for a while, as good code does.",
+      " * More prose here so comments outweigh the code by bytes.",
+      " * Still more, because that is normal and must not be a finding.",
+      " */",
+      "export function add(a, b) {",
+      "  // inline comment",
+      "  return a + b;",
+      "}",
+    ].join("\n");
+    expect(byRule(analyzeSource(code, "live.ts"), "MCP015")).toHaveLength(0);
+  });
+
+  it("does NOT fire on a short file", () => {
+    expect(byRule(analyzeSource("// tiny\n", "t.ts"), "MCP015")).toHaveLength(0);
+  });
+
+  it("does NOT fire on generated output directories", () => {
+    const code = "/** x */\n// " + "const y = 2; ".repeat(60);
+    expect(byRule(analyzeSource(code, "dist/bundle.js"), "MCP015")).toHaveLength(0);
+  });
+});

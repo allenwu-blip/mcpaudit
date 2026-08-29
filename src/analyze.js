@@ -59,8 +59,7 @@ const MAX_DEPTH = 40; // pathological deep trees / symlink-ish loops guard
  * vector — we skip the file and surface it as a diagnostic instead of
  * grinding (or worse, mis-reporting a finding at col 90000).
  */
-function looksMinified(txt) {
-  if (txt.length < 50000) return false;
+function longestLine(txt) {
   let longest = 0;
   let cur = 0;
   for (let i = 0; i < txt.length; i++) {
@@ -69,8 +68,42 @@ function looksMinified(txt) {
       cur = 0;
     } else cur++;
   }
-  if (cur > longest) longest = cur;
-  return longest > 5000;
+  return cur > longest ? cur : longest;
+}
+
+/**
+ * Tell a MINIFIED file from a COLLAPSED one. Both have enormous lines, so a
+ * bytes-per-line threshold cannot separate them -- and getting it wrong means
+ * skipping a file that should have been read.
+ *
+ * The distinguishing feature, pointed out by the token-optimizer-mcp maintainer
+ * after this scanner skipped one of their files: a minifier cannot leave `//`
+ * comments in, because a line comment would swallow the rest of the line, and
+ * in minified output the rest of the line is the whole program. So a giant line
+ * that STARTS with `//` is not minified output. It is source whose newlines
+ * were stripped, leaving the entire implementation inside one comment.
+ *
+ * In their repo, eight files had this shape -- 82 KB of code that ships in the
+ * npm tarball, compiles to an empty module, and is invisible to every
+ * line-based tool. The old guard caught the four large ones as "minified" and
+ * missed the four small ones entirely, because it required 50 KB before it
+ * would look at all. Size is the wrong signal for this; shape is the right one.
+ *
+ * Returns "minified" (skip it), "collapsed" (read it, and say so), or null.
+ */
+function classifyLongLines(txt) {
+  const longest = longestLine(txt);
+  if (longest <= 5000) return null;
+  // Only the first two lines matter: a collapsed file is a header comment on
+  // line 1 and the entire body behind `//` on line 2.
+  for (const line of txt.split("\n", 3)) {
+    if (line.length <= 5000) continue;
+    const t = line.trimStart();
+    if (t.startsWith("//") || /\*\/\s*\/\//.test(line.slice(0, 400))) {
+      return "collapsed";
+    }
+  }
+  return txt.length >= 50000 ? "minified" : null;
 }
 
 // Cheap binary sniff: a NUL in the first 4 KB ⇒ not source we should lex.
@@ -263,11 +296,23 @@ export function analyzeProject(rootDir, opts = {}) {
     if (!opts.includeTests && looksLikeTest(rel)) continue;
     const txt = safeRead(file, errors);
     if (txt == null) continue;
-    if (looksMinified(txt)) {
+    const shape = classifyLongLines(txt);
+    if (shape === "minified") {
       errors.push(
         `skipped minified/obfuscated source (very long lines): ${rel} — audit the original, not the bundle`,
       );
       continue;
+    }
+    if (shape === "collapsed") {
+      // Deliberately NOT skipped. The old guard called this minified and moved
+      // on; it is the opposite situation -- readable source that has been
+      // commented out wholesale, which is exactly the kind of thing an audit
+      // should say out loud rather than pass over.
+      errors.push(
+        `collapsed source (newlines stripped, body sits behind a line comment): ${rel} ` +
+          `— it parses to an empty module but still ships. Not minified output; a minifier ` +
+          `cannot emit \`//\` comments.`,
+      );
     }
     scannedFiles.push(rel);
     contentHash.set(rel, createHash("sha256").update(txt).digest("hex"));

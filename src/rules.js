@@ -1603,6 +1603,61 @@ function yamlLoadIsSafe(deps) {
   return Boolean(major) && Number(major[1]) >= 4;
 }
 
+// ---------------------------------------------------------------------------
+// MCP015 — a module that ships but does nothing
+//
+// Suggested by the ooples/token-optimizer-mcp maintainer after this scanner
+// skipped one of their files as "minified". It was not minified: its newlines
+// had been stripped, so the whole implementation ended up behind the `//` on
+// line 2 and the module compiled to nothing. Eight files in that repo had the
+// shape -- 82 KB of dead text in the published npm tarball, invisible to every
+// line-based tool pointed at it, this one included.
+//
+// Their framing is the right one: this is not a security rule, but "what does
+// this server actually expose" is the question an MCP audit exists to answer,
+// and a file that ships and exports nothing is a direct answer to it.
+//
+// Implemented on masked code, where comment bodies are already blanked. If
+// nothing survives masking, every byte in the file was a comment. That test has
+// no threshold and no pattern matching, so a 436-byte collapsed header is
+// caught as readily as a 55 KB collapsed implementation -- which a
+// bytes-per-line heuristic cannot do, and is why four of their eight slipped
+// past both of us.
+// ---------------------------------------------------------------------------
+function ruleDeadModule(orig, masked, file, findings) {
+  const { code } = masked;
+  // Directories whose files are expected to be side-effectful or generated.
+  if (/(^|[\\/])(dist|build|out|coverage|\.next|__mocks__)[\\/]/i.test(file)) return;
+  // A file too small to be a module at all is noise, not a finding.
+  if (orig.length < 200) return;
+
+  const live = code.replace(/[\s;]+/g, "");
+  if (live.length > 0) return;
+
+  // Everything was comment. Say which shape, because the remedy differs: a
+  // deliberately commented-out file wants deleting, a collapsed one wants its
+  // newlines back.
+  const longest = orig.split("\n").reduce((m, l) => (l.length > m ? l.length : m), 0);
+  const collapsed = longest > 5000;
+  findings.push(
+    mkFinding(
+      "MCP015",
+      "low",
+      file,
+      1,
+      1,
+      `This module contains no executable code — every byte outside whitespace is inside a comment, so it compiles to an empty module. It still ships to anyone who installs the package (${orig.length} bytes).` +
+        (collapsed
+          ? ` Its longest line is ${longest} characters, so this looks like source whose newlines were stripped, leaving the body behind a line comment rather than a deliberate comment-out.`
+          : ""),
+      collapsed
+        ? "Restore the newlines from version control if the code is still wanted, or delete the file. Check whether anything imports it first — if the module has been empty in production, nothing does."
+        : "Delete it, or move it out of the published `files` list. Dead text in a shipped tarball is surface with no function.",
+      orig,
+    ),
+  );
+}
+
 function ruleUnsafeDeserialize(orig, masked, file, findings, deps) {
   const { code } = masked;
   const yamlSafe = yamlLoadIsSafe(deps);
@@ -1701,6 +1756,7 @@ export function analyzeSource(src, relPath, cfg, stats, deps) {
   ruleHardcodedSecret(src, masked, relPath, findings);
   rulefsPathTraversal(src, masked, relPath, findings, cfg, stats);
   ruleUnsafeDeserialize(src, masked, relPath, findings, deps);
+  ruleDeadModule(src, masked, relPath, findings);
   return findings;
 }
 
