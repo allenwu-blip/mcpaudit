@@ -1,6 +1,8 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { analyzeProject } from "../src/analyze.js";
 import { gate, SEVERITY_ORDER } from "../src/rules.js";
 import { formatHuman, formatJson } from "../src/format.js";
@@ -121,5 +123,68 @@ describe("formatters", () => {
   it("formatHuman reports a clean bill of health on zero findings", () => {
     const s = formatHuman({ ...report, findings: [] });
     expect(s).toMatch(/no findings|clean/i);
+  });
+});
+
+// A repo that generates the same library into several integration directories
+// gets its finding count multiplied by the number of copies. Found scanning
+// ooples/token-optimizer-mcp, where `hooks-core/` is the source of truth and
+// ten copies are generated under `integrations/*/hooks/lib/` — 47% of that
+// scan's findings were nine files counted ten times.
+describe("generated/vendored duplicate accounting", () => {
+  let dir;
+  const VULN =
+    "import { execSync } from 'child_process';\n" +
+    "export function run(p) { return execSync(`ls ${p}`); }\n";
+
+  const mk = (rel, body) => {
+    const full = join(dir, rel);
+    mkdirSync(dirname(full), { recursive: true });
+    writeFileSync(full, body, "utf8");
+  };
+
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "mcpaudit-dupes-"));
+    mk("package.json", JSON.stringify({ name: "d", version: "1.0.0" }));
+    mk("hooks-core/lib.js", VULN);
+    for (const agent of ["cursor", "codex", "gemini"])
+      mk(`integrations/${agent}/hooks/lib.js`, VULN);
+    // A file with the same finding but DIFFERENT bytes is not a copy.
+    mk("src/other.js", VULN + "// unrelated module\n");
+  });
+
+  it("groups byte-identical files and states the deduplicated count", () => {
+    const r = analyzeProject(dir);
+    expect(r.duplicateGroups).toHaveLength(1);
+    expect(r.duplicateGroups[0].copies).toBe(4);
+    expect(r.duplicateGroups[0].perCopy).toBe(1);
+    // 4 copies + 1 unique file = 5 findings, 2 distinct.
+    expect(r.findings).toHaveLength(5);
+    const note = r.errors.find((e) => /byte-identical/.test(e));
+    expect(note).toBeTruthy();
+    expect(note).toMatch(/gives 2 distinct/);
+  });
+
+  it("still REPORTS every copy — dedup is accounting, not suppression", () => {
+    const r = analyzeProject(dir);
+    const files = r.findings.map((f) => f.file.replace(/\\/g, "/"));
+    expect(files).toContain("hooks-core/lib.js");
+    expect(files).toContain("integrations/cursor/hooks/lib.js");
+    expect(files).toContain("integrations/codex/hooks/lib.js");
+    expect(files).toContain("integrations/gemini/hooks/lib.js");
+  });
+
+  it("says nothing when identical files are clean", () => {
+    const clean = mkdtempSync(join(tmpdir(), "mcpaudit-clean-dupes-"));
+    for (const p of ["a/x.js", "b/x.js"]) {
+      mkdirSync(join(clean, dirname(p)), { recursive: true });
+      writeFileSync(join(clean, p), "export const N = 1;\n", "utf8");
+    }
+    const r = analyzeProject(clean);
+    expect(r.duplicateGroups).toHaveLength(0);
+    expect(r.errors.some((e) => /byte-identical/.test(e))).toBe(false);
+    rmSync(clean, { recursive: true, force: true });
   });
 });
